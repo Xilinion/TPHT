@@ -4,11 +4,47 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef TPHT_ENABLE_SIMD
+#define TPHT_ENABLE_SIMD 1
+#endif
+
+#define TPHT_SIMD_AUTO 0
+#define TPHT_SIMD_SCALAR 1
+#define TPHT_SIMD_SSE2 2
+#define TPHT_SIMD_AVX2 3
+#define TPHT_SIMD_NEON 4
+
+#ifndef TPHT_SIMD_MODE
+#define TPHT_SIMD_MODE TPHT_SIMD_AUTO
+#endif
+
+#if !TPHT_ENABLE_SIMD
+#undef TPHT_SIMD_MODE
+#define TPHT_SIMD_MODE TPHT_SIMD_SCALAR
+#endif
+
+#if TPHT_ENABLE_SIMD && (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
+#include <immintrin.h>
+#define TPHT_X86_SIMD 1
+#endif
+
+#if TPHT_ENABLE_SIMD && defined(__ARM_NEON)
+#include <arm_neon.h>
+#define TPHT_NEON_SIMD 1
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define TPHT_UNUSED __attribute__((unused))
+#else
+#define TPHT_UNUSED
+#endif
+
 #define TPHT_DEFAULT_BIN_SIZE 127u
 #define TPHT_DEFAULT_LOAD_FACTOR 0.85
 #define TPHT_MIN_CAPACITY 16u
 #define TPHT_FLAT_CLOUD_BYTES 64u
 #define TPHT_FLAT_META_BYTES 8u
+#define TPHT_FLAT_FP_GROUP 32u
 
 typedef struct tpht_pool {
     uint8_t *entries;
@@ -86,6 +122,117 @@ static uint64_t tpht_hash_bytes(const void *data, size_t len, uint64_t seed) {
 
 static uint64_t tpht_hash_word(uint64_t x, uint64_t seed) {
     return tpht_mix64(x ^ seed ^ UINT64_C(0x517cc1b727220a95));
+}
+
+static TPHT_UNUSED uint32_t tpht_low_mask(uint8_t count) {
+    return count >= 32u ? UINT32_MAX : ((UINT32_C(1) << count) - 1u);
+}
+
+static TPHT_UNUSED uint32_t tpht_fp_match_mask_scalar(const uint8_t *fps, uint8_t count, uint8_t fp) {
+    uint32_t mask = 0;
+    uint8_t i;
+    for (i = 0; i < count; ++i) {
+        if (fps[i] == fp) mask |= UINT32_C(1) << i;
+    }
+    return mask & tpht_low_mask(count);
+}
+
+#if defined(TPHT_X86_SIMD) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("avx2")))
+static TPHT_UNUSED uint32_t tpht_fp_match_mask_avx2(const uint8_t *fps, uint8_t count, uint8_t fp) {
+    __m256i needle = _mm256_set1_epi8((char)fp);
+    __m256i hay = _mm256_loadu_si256((const __m256i *)(const void *)fps);
+    __m256i eq = _mm256_cmpeq_epi8(hay, needle);
+    return (uint32_t)_mm256_movemask_epi8(eq) & tpht_low_mask(count);
+}
+
+static TPHT_UNUSED int tpht_cpu_has_avx2(void) {
+#if defined(__GNUC__) || defined(__clang__)
+    static int cached = -1;
+    if (cached < 0) cached = __builtin_cpu_supports("avx2") ? 1 : 0;
+    return cached;
+#else
+    return 0;
+#endif
+}
+#endif
+
+#if defined(TPHT_X86_SIMD) && (defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86_FP))
+static TPHT_UNUSED uint32_t tpht_fp_match_mask_sse2(const uint8_t *fps, uint8_t count, uint8_t fp) {
+    __m128i needle = _mm_set1_epi8((char)fp);
+    __m128i hay0 = _mm_loadu_si128((const __m128i *)(const void *)fps);
+    uint32_t mask = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(hay0, needle));
+    if (count > 16u) {
+        __m128i hay1 = _mm_loadu_si128((const __m128i *)(const void *)(fps + 16u));
+        mask |= (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(hay1, needle)) << 16u;
+    }
+    return mask & tpht_low_mask(count);
+}
+#endif
+
+#if defined(TPHT_NEON_SIMD)
+static TPHT_UNUSED uint32_t tpht_fp_match_mask_neon(const uint8_t *fps, uint8_t count, uint8_t fp) {
+    uint8x16_t needle = vdupq_n_u8(fp);
+    uint32_t mask = 0;
+    uint8_t tmp[16];
+    uint8_t i;
+    vst1q_u8(tmp, vceqq_u8(vld1q_u8(fps), needle));
+    for (i = 0; i < 16u && i < count; ++i) {
+        if (tmp[i]) mask |= UINT32_C(1) << i;
+    }
+    if (count > 16u) {
+        vst1q_u8(tmp, vceqq_u8(vld1q_u8(fps + 16u), needle));
+        for (i = 0; i < count - 16u; ++i) {
+            if (tmp[i]) mask |= UINT32_C(1) << (i + 16u);
+        }
+    }
+    return mask;
+}
+#endif
+
+static uint32_t tpht_fp_match_mask(const uint8_t *fps, uint8_t count, uint8_t fp) {
+#if TPHT_SIMD_MODE == TPHT_SIMD_SCALAR
+    return tpht_fp_match_mask_scalar(fps, count, fp);
+#elif TPHT_SIMD_MODE == TPHT_SIMD_AVX2
+#if defined(TPHT_X86_SIMD) && (defined(__GNUC__) || defined(__clang__))
+    return tpht_fp_match_mask_avx2(fps, count, fp);
+#else
+    return tpht_fp_match_mask_scalar(fps, count, fp);
+#endif
+#elif TPHT_SIMD_MODE == TPHT_SIMD_SSE2
+#if defined(TPHT_X86_SIMD) && (defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86_FP))
+    return tpht_fp_match_mask_sse2(fps, count, fp);
+#else
+    return tpht_fp_match_mask_scalar(fps, count, fp);
+#endif
+#elif TPHT_SIMD_MODE == TPHT_SIMD_NEON
+#if defined(TPHT_NEON_SIMD)
+    return tpht_fp_match_mask_neon(fps, count, fp);
+#else
+    return tpht_fp_match_mask_scalar(fps, count, fp);
+#endif
+#else
+#if defined(TPHT_X86_SIMD) && (defined(__GNUC__) || defined(__clang__))
+    if (count > 16u && tpht_cpu_has_avx2()) return tpht_fp_match_mask_avx2(fps, count, fp);
+#endif
+#if defined(TPHT_X86_SIMD) && (defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86_FP))
+    return tpht_fp_match_mask_sse2(fps, count, fp);
+#elif defined(TPHT_NEON_SIMD)
+    return tpht_fp_match_mask_neon(fps, count, fp);
+#else
+    return tpht_fp_match_mask_scalar(fps, count, fp);
+#endif
+#endif
+}
+
+static uint8_t tpht_ctz32(uint32_t x) {
+#if defined(__GNUC__) || defined(__clang__)
+    return (uint8_t)__builtin_ctz(x);
+#else
+    uint8_t n = 0;
+    while (((x >> n) & 1u) == 0u) ++n;
+    return n;
+#endif
 }
 
 static void tpht_lock(tpht_table_t *t) {
@@ -182,7 +329,6 @@ static void tpht_free_storage(tpht_table_t *t) {
 }
 
 static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
-    size_t inline_bytes;
     size_t overflow_slots;
     size_t cloud_target;
 
@@ -200,10 +346,7 @@ static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
         t->heads = (uint8_t *)calloc(t->base_count, 1);
         overflow_slots = t->capacity + t->capacity / 4u + (size_t)t->pool.bin_size;
     } else {
-        inline_bytes = TPHT_FLAT_CLOUD_BYTES - TPHT_FLAT_META_BYTES;
-        t->flat_inline_cap = (uint8_t)(inline_bytes / (1u + t->inline_entry_size));
-        if (t->flat_inline_cap == 0) t->flat_inline_cap = 1;
-        if (t->flat_inline_cap > 7u) t->flat_inline_cap = 7u;
+        t->flat_inline_cap = TPHT_FLAT_FP_GROUP;
 
         cloud_target = (t->capacity + t->flat_inline_cap - 1u) / t->flat_inline_cap;
         t->base_count = tpht_pow2_ceil(tpht_max_size(cloud_target, 1));
@@ -325,11 +468,13 @@ static tpht_status_t tpht_flat_get_raw(tpht_table_t *t, const void *key, void *v
     uint8_t count = t->flat_count[cloud];
     uint8_t *fps = t->flat_fp + cloud * (size_t)t->flat_inline_cap;
     uint8_t *prev;
-    uint8_t i;
+    uint32_t mask = tpht_fp_match_mask(fps, count, fp);
 
-    for (i = 0; i < count; ++i) {
+    while (mask) {
+        uint8_t i = tpht_ctz32(mask);
         uint8_t *slot = tpht_inline_entry(t, cloud, i);
-        if (fps[i] == fp && tpht_key_equal(t, slot, key)) {
+        mask &= mask - 1u;
+        if (tpht_key_equal(t, slot, key)) {
             if (value_out) memcpy(value_out, slot + t->key_size, t->value_size);
             return TPHT_OK;
         }
@@ -355,12 +500,14 @@ static tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, const void *key,
     uint8_t *fps = t->flat_fp + cloud * (size_t)t->flat_inline_cap;
     uint8_t *prev;
     uint8_t encoded;
-    uint8_t i;
+    uint32_t mask = tpht_fp_match_mask(fps, count, fp);
     uint8_t *entry;
 
-    for (i = 0; i < count; ++i) {
+    while (mask) {
+        uint8_t i = tpht_ctz32(mask);
         uint8_t *slot = tpht_inline_entry(t, cloud, i);
-        if (fps[i] == fp && tpht_key_equal(t, slot, key)) {
+        mask &= mask - 1u;
+        if (tpht_key_equal(t, slot, key)) {
             if (!replace) return TPHT_EXISTS;
             memcpy(slot + t->key_size, value, t->value_size);
             return TPHT_OK;
@@ -402,12 +549,14 @@ static tpht_status_t tpht_flat_remove_raw(tpht_table_t *t, const void *key) {
     uint8_t fp = tpht_fingerprint(t, key);
     uint8_t count = t->flat_count[cloud];
     uint8_t *fps = t->flat_fp + cloud * (size_t)t->flat_inline_cap;
-    uint8_t i;
+    uint32_t mask = tpht_fp_match_mask(fps, count, fp);
     uint8_t *prev;
 
-    for (i = 0; i < count; ++i) {
+    while (mask) {
+        uint8_t i = tpht_ctz32(mask);
         uint8_t *slot = tpht_inline_entry(t, cloud, i);
-        if (fps[i] == fp && tpht_key_equal(t, slot, key)) {
+        mask &= mask - 1u;
+        if (tpht_key_equal(t, slot, key)) {
             if (t->heads[cloud]) {
                 uint8_t encoded = t->heads[cloud];
                 uint8_t *entry = tpht_pool_deref(t, (uint64_t)cloud, encoded);
