@@ -5,7 +5,7 @@ Industrial C implementation of Tiny Pointer Hash Tables.  This repository keeps 
 - `chained-tpht`: derived from the `byte_array_chained_ht` idea.
 - `flatten-tpht`: derived from the `blast_ht` idea, with inline fingerprint groups and overflow tiny pointers.
 
-The code is designed to be copied directly into another project: copy `tpht.h` and `tpht.c`.  If you prefer variant-specific names, also copy `chained_tpht.h` and/or `flatten_tpht.h`.
+The code is designed to be copied directly into another project: copy `tpht.h` and `tpht.c`.
 
 ## Features
 
@@ -23,7 +23,7 @@ The code is designed to be copied directly into another project: copy `tpht.h` a
 #include "tpht.h"
 
 int main(void) {
-    tpht_table_t *t = tpht_flatten_resizable_create(1024, 8, 8);
+    tpht_table_t *t = flatten_tpht_resizable_create(1024, 8, 8);
     unsigned long long value;
 
     tpht_put_u64(t, 42, 9001);
@@ -42,44 +42,24 @@ Compile:
 cc -std=c11 -O2 -I. tpht.c your_file.c -o your_program
 ```
 
-## Variant-specific headers
-
-For explicit chained usage:
-
-```c
-#include "chained_tpht.h"
-
-chained_tpht_t *t = chained_tpht_resizable_create(1024, 8, 8);
-```
-
-For explicit flattened usage:
-
-```c
-#include "flatten_tpht.h"
-
-flatten_tpht_t *t = flatten_tpht_concurrent_resizable_create(1024, 8, 8);
-```
-
-Both headers are thin wrappers over `tpht.h`; `tpht.c` is still the only source file needed.
-
 ## Constructors
 
 Chained variant:
 
 ```c
-tpht_chained_fixed_create(capacity, key_size, value_size);
-tpht_chained_resizable_create(capacity, key_size, value_size);
-tpht_chained_concurrent_fixed_create(capacity, key_size, value_size);
-tpht_chained_concurrent_resizable_create(capacity, key_size, value_size);
+chained_tpht_fixed_create(capacity, key_size, value_size);
+chained_tpht_resizable_create(capacity, key_size, value_size);
+chained_tpht_concurrent_fixed_create(capacity, key_size, value_size);
+chained_tpht_concurrent_resizable_create(capacity, key_size, value_size);
 ```
 
 Flattened variant:
 
 ```c
-tpht_flatten_fixed_create(capacity, key_size, value_size);
-tpht_flatten_resizable_create(capacity, key_size, value_size);
-tpht_flatten_concurrent_fixed_create(capacity, key_size, value_size);
-tpht_flatten_concurrent_resizable_create(capacity, key_size, value_size);
+flatten_tpht_fixed_create(capacity, key_size, value_size);
+flatten_tpht_resizable_create(capacity, key_size, value_size);
+flatten_tpht_concurrent_fixed_create(capacity, key_size, value_size);
+flatten_tpht_concurrent_resizable_create(capacity, key_size, value_size);
 ```
 
 `key_size` and `value_size` must be one of `2`, `4`, or `8`.
@@ -128,7 +108,7 @@ TPHT_SIMD_NEON
 Example forced AVX2 test build:
 
 ```sh
-cc -std=c11 -O2 -mavx2 -DTPHT_SIMD_MODE=3 -I. tpht.c tests/tpht_test.c -o tpht_avx2_test
+./tests/run_tpht_tests.sh
 ```
 
 Only run forced instruction-set binaries on machines that support that instruction set.
@@ -152,3 +132,14 @@ The script covers:
 - `-march=native` build when supported
 
 The test program covers all variants, threading modes, resize modes, and all 2/4/8-byte key-value combinations, plus duplicate insertion, updates, removals, fixed-table full behavior, doubling resize behavior, invalid configs, randomized model checking, and real threaded insertion stress.
+
+The tests are split into controlled-granularity modules:
+
+- `tests/tpht_test.c`: single aggregate entrypoint.
+- `tests/tpht_test_common.[ch]`: shared helpers and case enumeration.
+- `tests/tpht_test_config.c`: invalid/default configuration tests.
+- `tests/tpht_test_constructors.c`: generic and variant-specific constructor tests.
+- `tests/tpht_test_api_edges.c`: API edge/error/full-table behavior.
+- `tests/tpht_test_deterministic.c`: deterministic insert/get/update/remove/resize checks.
+- `tests/tpht_test_random_model.c`: randomized model-check tests.
+- `tests/tpht_test_threads.c`: pthread-backed concurrent stress tests when enabled.

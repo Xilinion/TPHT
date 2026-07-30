@@ -82,25 +82,25 @@ tpht_threading_t tpht_get_threading(const tpht_table_t *table);
 tpht_resize_mode_t tpht_get_resize_mode(const tpht_table_t *table);
 
 /* Explicit constructors requested for the industrial variants. */
-tpht_table_t *tpht_chained_fixed_create(size_t capacity, uint8_t key_size,
+tpht_table_t *chained_tpht_fixed_create(size_t capacity, uint8_t key_size,
                                         uint8_t value_size);
-tpht_table_t *tpht_chained_resizable_create(size_t capacity, uint8_t key_size,
+tpht_table_t *chained_tpht_resizable_create(size_t capacity, uint8_t key_size,
                                             uint8_t value_size);
-tpht_table_t *tpht_chained_concurrent_fixed_create(size_t capacity,
+tpht_table_t *chained_tpht_concurrent_fixed_create(size_t capacity,
                                                    uint8_t key_size,
                                                    uint8_t value_size);
-tpht_table_t *tpht_chained_concurrent_resizable_create(size_t capacity,
+tpht_table_t *chained_tpht_concurrent_resizable_create(size_t capacity,
                                                        uint8_t key_size,
                                                        uint8_t value_size);
 
-tpht_table_t *tpht_flatten_fixed_create(size_t capacity, uint8_t key_size,
+tpht_table_t *flatten_tpht_fixed_create(size_t capacity, uint8_t key_size,
                                         uint8_t value_size);
-tpht_table_t *tpht_flatten_resizable_create(size_t capacity, uint8_t key_size,
+tpht_table_t *flatten_tpht_resizable_create(size_t capacity, uint8_t key_size,
                                             uint8_t value_size);
-tpht_table_t *tpht_flatten_concurrent_fixed_create(size_t capacity,
+tpht_table_t *flatten_tpht_concurrent_fixed_create(size_t capacity,
                                                    uint8_t key_size,
                                                    uint8_t value_size);
-tpht_table_t *tpht_flatten_concurrent_resizable_create(size_t capacity,
+tpht_table_t *flatten_tpht_concurrent_resizable_create(size_t capacity,
                                                        uint8_t key_size,
                                                        uint8_t value_size);
 

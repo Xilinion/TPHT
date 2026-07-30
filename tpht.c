@@ -814,14 +814,14 @@ static tpht_table_t *tpht_make(size_t capacity, uint8_t key_size, uint8_t value_
     return tpht_create(&c);
 }
 
-tpht_table_t *tpht_chained_fixed_create(size_t c, uint8_t k, uint8_t v) { return tpht_make(c, k, v, TPHT_CHAINED, TPHT_SEQUENTIAL, TPHT_FIXED); }
-tpht_table_t *tpht_chained_resizable_create(size_t c, uint8_t k, uint8_t v) { return tpht_make(c, k, v, TPHT_CHAINED, TPHT_SEQUENTIAL, TPHT_RESIZABLE); }
-tpht_table_t *tpht_chained_concurrent_fixed_create(size_t c, uint8_t k, uint8_t v) { return tpht_make(c, k, v, TPHT_CHAINED, TPHT_CONCURRENT, TPHT_FIXED); }
-tpht_table_t *tpht_chained_concurrent_resizable_create(size_t c, uint8_t k, uint8_t v) { return tpht_make(c, k, v, TPHT_CHAINED, TPHT_CONCURRENT, TPHT_RESIZABLE); }
-tpht_table_t *tpht_flatten_fixed_create(size_t c, uint8_t k, uint8_t v) { return tpht_make(c, k, v, TPHT_FLATTEN, TPHT_SEQUENTIAL, TPHT_FIXED); }
-tpht_table_t *tpht_flatten_resizable_create(size_t c, uint8_t k, uint8_t v) { return tpht_make(c, k, v, TPHT_FLATTEN, TPHT_SEQUENTIAL, TPHT_RESIZABLE); }
-tpht_table_t *tpht_flatten_concurrent_fixed_create(size_t c, uint8_t k, uint8_t v) { return tpht_make(c, k, v, TPHT_FLATTEN, TPHT_CONCURRENT, TPHT_FIXED); }
-tpht_table_t *tpht_flatten_concurrent_resizable_create(size_t c, uint8_t k, uint8_t v) { return tpht_make(c, k, v, TPHT_FLATTEN, TPHT_CONCURRENT, TPHT_RESIZABLE); }
+tpht_table_t *chained_tpht_fixed_create(size_t c, uint8_t k, uint8_t v) { return tpht_make(c, k, v, TPHT_CHAINED, TPHT_SEQUENTIAL, TPHT_FIXED); }
+tpht_table_t *chained_tpht_resizable_create(size_t c, uint8_t k, uint8_t v) { return tpht_make(c, k, v, TPHT_CHAINED, TPHT_SEQUENTIAL, TPHT_RESIZABLE); }
+tpht_table_t *chained_tpht_concurrent_fixed_create(size_t c, uint8_t k, uint8_t v) { return tpht_make(c, k, v, TPHT_CHAINED, TPHT_CONCURRENT, TPHT_FIXED); }
+tpht_table_t *chained_tpht_concurrent_resizable_create(size_t c, uint8_t k, uint8_t v) { return tpht_make(c, k, v, TPHT_CHAINED, TPHT_CONCURRENT, TPHT_RESIZABLE); }
+tpht_table_t *flatten_tpht_fixed_create(size_t c, uint8_t k, uint8_t v) { return tpht_make(c, k, v, TPHT_FLATTEN, TPHT_SEQUENTIAL, TPHT_FIXED); }
+tpht_table_t *flatten_tpht_resizable_create(size_t c, uint8_t k, uint8_t v) { return tpht_make(c, k, v, TPHT_FLATTEN, TPHT_SEQUENTIAL, TPHT_RESIZABLE); }
+tpht_table_t *flatten_tpht_concurrent_fixed_create(size_t c, uint8_t k, uint8_t v) { return tpht_make(c, k, v, TPHT_FLATTEN, TPHT_CONCURRENT, TPHT_FIXED); }
+tpht_table_t *flatten_tpht_concurrent_resizable_create(size_t c, uint8_t k, uint8_t v) { return tpht_make(c, k, v, TPHT_FLATTEN, TPHT_CONCURRENT, TPHT_RESIZABLE); }
 
 tpht_status_t tpht_put_u64(tpht_table_t *table, uint64_t key, uint64_t value) {
     uint8_t k[8], v[8];

@@ -5,6 +5,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 CC=${CC:-cc}
 BUILD_DIR=${BUILD_DIR:-"$ROOT/build-tests"}
 COMMON_FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I$ROOT"
+TEST_SRCS="$ROOT/tests/tpht_test.c $ROOT/tests/tpht_test_common.c $ROOT/tests/tpht_test_config.c $ROOT/tests/tpht_test_constructors.c $ROOT/tests/tpht_test_api_edges.c $ROOT/tests/tpht_test_deterministic.c $ROOT/tests/tpht_test_random_model.c $ROOT/tests/tpht_test_threads.c"
 
 mkdir -p "$BUILD_DIR"
 
@@ -15,7 +16,7 @@ run_case() {
     out="$BUILD_DIR/$name"
     echo "[tpht] build $name"
     # shellcheck disable=SC2086
-    $CC $COMMON_FLAGS $flags "$ROOT/tpht.c" "$ROOT/tests/tpht_test.c" $libs -o "$out"
+    $CC $COMMON_FLAGS $flags "$ROOT/tpht.c" $TEST_SRCS $libs -o "$out"
     echo "[tpht] run $name"
     "$out"
 }
@@ -42,7 +43,7 @@ if printf '%s\n' '#ifndef __AVX2__
 #endif
 int main(void){return 0;}' | $CC $COMMON_FLAGS -mavx2 -x c - -c -o "$BUILD_DIR/probe_avx2.o" >/dev/null 2>&1; then
     if $CC $COMMON_FLAGS -mavx2 -DTPHT_ENABLE_SIMD=1 -DTPHT_SIMD_MODE=3 \
-        "$ROOT/tpht.c" "$ROOT/tests/tpht_test.c" -o "$BUILD_DIR/forced_avx2" >/dev/null 2>&1; then
+        "$ROOT/tpht.c" $TEST_SRCS -o "$BUILD_DIR/forced_avx2" >/dev/null 2>&1; then
         :
     else
         echo "[tpht] skip forced_avx2: TPHT AVX2 build failed"
@@ -70,7 +71,7 @@ else
 fi
 
 if $CC $COMMON_FLAGS -DTPHT_ENABLE_SIMD=1 -DTPHT_TEST_WITH_THREADS \
-    "$ROOT/tpht.c" "$ROOT/tests/tpht_test.c" -pthread -o "$BUILD_DIR/threaded" >/dev/null 2>&1; then
+    "$ROOT/tpht.c" $TEST_SRCS -pthread -o "$BUILD_DIR/threaded" >/dev/null 2>&1; then
     echo "[tpht] run threaded"
     "$BUILD_DIR/threaded"
 else
@@ -78,7 +79,7 @@ else
 fi
 
 if $CC $COMMON_FLAGS -march=native -DTPHT_ENABLE_SIMD=1 \
-    "$ROOT/tpht.c" "$ROOT/tests/tpht_test.c" -o "$BUILD_DIR/native" >/dev/null 2>&1; then
+    "$ROOT/tpht.c" $TEST_SRCS -o "$BUILD_DIR/native" >/dev/null 2>&1; then
     echo "[tpht] run native"
     "$BUILD_DIR/native"
 else
