@@ -21,4 +21,5 @@ void tpht_test_run_constructor_module(void) {
         tpht_test_assert_get(tables[i], 8, 8, 7, 11);
         tpht_destroy(tables[i]);
     }
+
 }

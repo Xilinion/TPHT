@@ -74,7 +74,8 @@ void tpht_test_assert_missing(tpht_table_t *table, uint8_t key_size,
 }
 
 void tpht_test_for_each_case(void (*fn)(const tpht_test_case_t *tc)) {
-    uint8_t sizes[] = {2u, 4u, 8u};
+    uint8_t key_sizes[] = {2u, 4u, 8u};
+    uint8_t value_sizes[] = {2u, 4u, 8u};
     tpht_variant_t variants[] = {TPHT_CHAINED, TPHT_FLATTEN};
     tpht_threading_t threadings[] = {TPHT_SEQUENTIAL, TPHT_CONCURRENT};
     tpht_resize_mode_t resize_modes[] = {TPHT_FIXED, TPHT_RESIZABLE};
@@ -83,14 +84,14 @@ void tpht_test_for_each_case(void (*fn)(const tpht_test_case_t *tc)) {
     for (vi = 0; vi < 2u; ++vi) {
         for (ti = 0; ti < 2u; ++ti) {
             for (ri = 0; ri < 2u; ++ri) {
-                for (ki = 0; ki < 3u; ++ki) {
-                    for (vali = 0; vali < 3u; ++vali) {
+                for (ki = 0; ki < sizeof(key_sizes) / sizeof(key_sizes[0]); ++ki) {
+                    for (vali = 0; vali < sizeof(value_sizes) / sizeof(value_sizes[0]); ++vali) {
                         tpht_test_case_t tc;
                         tc.variant = variants[vi];
                         tc.threading = threadings[ti];
                         tc.resize_mode = resize_modes[ri];
-                        tc.key_size = sizes[ki];
-                        tc.value_size = sizes[vali];
+                        tc.key_size = key_sizes[ki];
+                        tc.value_size = value_sizes[vali];
                         fn(&tc);
                     }
                 }

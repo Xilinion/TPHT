@@ -12,6 +12,9 @@ void tpht_test_run_config_module(void) {
     c = tpht_default_config();
     c.value_size = 3;
     assert(tpht_create(&c) == NULL);
+    c = tpht_default_config();
+    c.value_size = 0;
+    assert(tpht_create(&c) == NULL);
 
     c = tpht_default_config();
     c.bin_size = 128;

@@ -19,5 +19,8 @@ add_executable(tpht_test
     tests/tpht_test_threads.c)
 target_link_libraries(tpht_test PRIVATE tpht)
 
+add_executable(tpht_space_eff benchmarks/tpht_space_eff.c)
+target_link_libraries(tpht_space_eff PRIVATE tpht)
+
 enable_testing()
 add_test(NAME tpht_test COMMAND tpht_test)

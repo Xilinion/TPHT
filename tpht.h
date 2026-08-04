@@ -77,6 +77,7 @@ tpht_status_t tpht_remove(tpht_table_t *table, const void *key);
 
 size_t tpht_size(const tpht_table_t *table);
 size_t tpht_capacity(const tpht_table_t *table);
+size_t tpht_memory_bytes(const tpht_table_t *table);
 tpht_variant_t tpht_get_variant(const tpht_table_t *table);
 tpht_threading_t tpht_get_threading(const tpht_table_t *table);
 tpht_resize_mode_t tpht_get_resize_mode(const tpht_table_t *table);

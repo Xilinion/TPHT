@@ -61,8 +61,12 @@ struct tpht_table {
 
     size_t key_size;
     size_t value_size;
+    size_t key_quotient_size;
     size_t inline_entry_size; /* key + value. */
     size_t pool_entry_size;   /* next + key + value. */
+    uint8_t key_bits;
+    uint8_t base_bits;
+    uint64_t base_mask;
 
     size_t base_count; /* chained base buckets or flatten clouds. */
     uint8_t *heads;    /* chained heads, or flatten overflow heads. */
@@ -76,7 +80,8 @@ struct tpht_table {
     atomic_flag lock;
 };
 
-static int tpht_valid_size(uint8_t n) { return n == 2u || n == 4u || n == 8u; }
+static int tpht_valid_key_size(uint8_t n) { return n == 2u || n == 4u || n == 8u; }
+static int tpht_valid_value_size(uint8_t n) { return n == 2u || n == 4u || n == 8u; }
 
 static size_t tpht_max_size(size_t a, size_t b) { return a > b ? a : b; }
 
@@ -85,6 +90,15 @@ static size_t tpht_pow2_ceil(size_t x) {
     if (x <= 1) return 1;
     while (p < x && p <= ((size_t)-1 / 2)) p <<= 1;
     return p < x ? x : p;
+}
+
+static uint8_t tpht_log2_pow2(size_t x) {
+    uint8_t bits = 0;
+    while (x > 1u) {
+        x >>= 1u;
+        ++bits;
+    }
+    return bits;
 }
 
 static uint64_t tpht_read_le(const void *p, size_t n) {
@@ -122,6 +136,40 @@ static uint64_t tpht_hash_bytes(const void *data, size_t len, uint64_t seed) {
 
 static uint64_t tpht_hash_word(uint64_t x, uint64_t seed) {
     return tpht_mix64(x ^ seed ^ UINT64_C(0x517cc1b727220a95));
+}
+
+static uint64_t tpht_key_word(const tpht_table_t *t, const void *key) {
+    return tpht_read_le(key, t->key_size) &
+           (t->key_bits == 64u ? UINT64_MAX : ((UINT64_C(1) << t->key_bits) - 1u));
+}
+
+static uint64_t tpht_key_quotient(const tpht_table_t *t, const void *key) {
+    return tpht_key_word(t, key) >> t->base_bits;
+}
+
+static size_t tpht_base_from_word(const tpht_table_t *t, uint64_t key_word) {
+    uint64_t quotient = key_word >> t->base_bits;
+    return (size_t)((tpht_hash_word(quotient, t->cfg.hash_seed) ^ key_word) & t->base_mask);
+}
+
+static size_t tpht_base_from_key(const tpht_table_t *t, const void *key) {
+    return tpht_base_from_word(t, tpht_key_word(t, key));
+}
+
+static void tpht_write_quotient(const tpht_table_t *t, uint8_t *dst, const void *key) {
+    tpht_write_le(dst, t->key_quotient_size, tpht_key_quotient(t, key));
+}
+
+static uint64_t tpht_read_quotient(const tpht_table_t *t, const uint8_t *stored_key) {
+    return tpht_read_le(stored_key, t->key_quotient_size);
+}
+
+static void tpht_rebuild_key(const tpht_table_t *t, size_t base, const uint8_t *stored_key,
+                             uint8_t *key_out) {
+    uint64_t quotient = tpht_read_quotient(t, stored_key);
+    uint64_t low = (tpht_hash_word(quotient, t->cfg.hash_seed) ^ (uint64_t)base) & t->base_mask;
+    uint64_t key_word = (quotient << t->base_bits) | low;
+    tpht_write_le(key_out, t->key_size, key_word);
 }
 
 static TPHT_UNUSED uint32_t tpht_low_mask(uint8_t count) {
@@ -335,21 +383,34 @@ static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
     t->capacity = tpht_max_size(capacity, TPHT_MIN_CAPACITY);
     t->key_size = t->cfg.key_size;
     t->value_size = t->cfg.value_size;
-    t->inline_entry_size = t->key_size + t->value_size;
-    t->pool_entry_size = 1u + t->inline_entry_size;
     t->pool.bin_size = t->cfg.bin_size ? t->cfg.bin_size : TPHT_DEFAULT_BIN_SIZE;
     if (t->pool.bin_size == 0 || t->pool.bin_size > 127u) return 0;
-    t->pool.entry_size = t->pool_entry_size;
 
     if (t->cfg.variant == TPHT_CHAINED) {
         t->base_count = tpht_pow2_ceil(t->capacity);
+        t->key_bits = (uint8_t)(t->key_size * 8u);
+        t->base_bits = tpht_log2_pow2(t->base_count);
+        if (t->base_bits > t->key_bits) t->base_bits = t->key_bits;
+        t->base_mask = t->base_bits == 64u ? UINT64_MAX : ((UINT64_C(1) << t->base_bits) - 1u);
+        t->key_quotient_size = (size_t)((t->key_bits - t->base_bits + 7u) / 8u);
+        t->inline_entry_size = t->key_quotient_size + t->value_size;
+        t->pool_entry_size = 1u + t->inline_entry_size;
+        t->pool.entry_size = t->pool_entry_size;
         t->heads = (uint8_t *)calloc(t->base_count, 1);
-        overflow_slots = t->capacity + t->capacity / 4u + (size_t)t->pool.bin_size;
+        overflow_slots = t->capacity + (size_t)t->pool.bin_size;
     } else {
         t->flat_inline_cap = TPHT_FLAT_FP_GROUP;
 
         cloud_target = (t->capacity + t->flat_inline_cap - 1u) / t->flat_inline_cap;
         t->base_count = tpht_pow2_ceil(tpht_max_size(cloud_target, 1));
+        t->key_bits = (uint8_t)(t->key_size * 8u);
+        t->base_bits = tpht_log2_pow2(t->base_count);
+        if (t->base_bits > t->key_bits) t->base_bits = t->key_bits;
+        t->base_mask = t->base_bits == 64u ? UINT64_MAX : ((UINT64_C(1) << t->base_bits) - 1u);
+        t->key_quotient_size = (size_t)((t->key_bits - t->base_bits + 7u) / 8u);
+        t->inline_entry_size = t->key_quotient_size + t->value_size;
+        t->pool_entry_size = 1u + t->inline_entry_size;
+        t->pool.entry_size = t->pool_entry_size;
         t->heads = (uint8_t *)calloc(t->base_count, 1);
         t->flat_count = (uint8_t *)calloc(t->base_count, 1);
         t->flat_fp = (uint8_t *)calloc(t->base_count * (size_t)t->flat_inline_cap, 1);
@@ -374,16 +435,16 @@ static uint8_t *tpht_inline_entry(tpht_table_t *t, size_t cloud, size_t pos) {
     return t->flat_entries + ((cloud * (size_t)t->flat_inline_cap + pos) * t->inline_entry_size);
 }
 
-static int tpht_key_equal(tpht_table_t *t, const uint8_t *a, const void *key) {
-    return memcmp(a, key, t->key_size) == 0;
+static int tpht_stored_key_equal(tpht_table_t *t, const uint8_t *stored_key, const void *key) {
+    return tpht_read_quotient(t, stored_key) == tpht_key_quotient(t, key);
 }
 
 static size_t tpht_chained_base(tpht_table_t *t, const void *key) {
-    return (size_t)(tpht_hash_bytes(key, t->key_size, t->cfg.hash_seed) & (uint64_t)(t->base_count - 1u));
+    return tpht_base_from_key(t, key);
 }
 
 static size_t tpht_flat_cloud(tpht_table_t *t, const void *key) {
-    return (size_t)(tpht_hash_bytes(key, t->key_size, t->cfg.hash_seed + 0x8000u) & (uint64_t)(t->base_count - 1u));
+    return tpht_base_from_key(t, key);
 }
 
 static uint8_t tpht_fingerprint(tpht_table_t *t, const void *key) {
@@ -396,8 +457,8 @@ static tpht_status_t tpht_chained_get_raw(tpht_table_t *t, const void *key, void
     uint8_t *prev = &t->heads[base];
     while (*prev) {
         uint8_t *entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev);
-        if (tpht_key_equal(t, entry + 1u, key)) {
-            if (value_out) memcpy(value_out, entry + 1u + t->key_size, t->value_size);
+        if (tpht_stored_key_equal(t, entry + 1u, key)) {
+            if (value_out && t->value_size) memcpy(value_out, entry + 1u + t->key_quotient_size, t->value_size);
             return TPHT_OK;
         }
         prev = entry;
@@ -413,9 +474,9 @@ static tpht_status_t tpht_chained_insert_raw(tpht_table_t *t, const void *key,
     uint8_t *entry;
     while (*prev) {
         entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev);
-        if (tpht_key_equal(t, entry + 1u, key)) {
+        if (tpht_stored_key_equal(t, entry + 1u, key)) {
             if (!replace) return TPHT_EXISTS;
-            memcpy(entry + 1u + t->key_size, value, t->value_size);
+            if (t->value_size) memcpy(entry + 1u + t->key_quotient_size, value, t->value_size);
             return TPHT_OK;
         }
         prev = entry;
@@ -425,8 +486,8 @@ static tpht_status_t tpht_chained_insert_raw(tpht_table_t *t, const void *key,
     if (!entry) return TPHT_FULL;
     *prev = encoded;
     entry[0] = 0;
-    memcpy(entry + 1u, key, t->key_size);
-    memcpy(entry + 1u + t->key_size, value, t->value_size);
+    tpht_write_quotient(t, entry + 1u, key);
+    if (t->value_size) memcpy(entry + 1u + t->key_quotient_size, value, t->value_size);
     t->size++;
     return TPHT_OK;
 }
@@ -441,7 +502,7 @@ static tpht_status_t tpht_chained_remove_raw(tpht_table_t *t, const void *key) {
     while (*prev) {
         uint8_t encoded = *prev;
         uint8_t *entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, encoded);
-        if (tpht_key_equal(t, entry + 1u, key)) {
+        if (tpht_stored_key_equal(t, entry + 1u, key)) {
             target = entry;
         }
         last_prev = prev;
@@ -474,8 +535,8 @@ static tpht_status_t tpht_flat_get_raw(tpht_table_t *t, const void *key, void *v
         uint8_t i = tpht_ctz32(mask);
         uint8_t *slot = tpht_inline_entry(t, cloud, i);
         mask &= mask - 1u;
-        if (tpht_key_equal(t, slot, key)) {
-            if (value_out) memcpy(value_out, slot + t->key_size, t->value_size);
+        if (tpht_stored_key_equal(t, slot, key)) {
+            if (value_out && t->value_size) memcpy(value_out, slot + t->key_quotient_size, t->value_size);
             return TPHT_OK;
         }
     }
@@ -483,8 +544,8 @@ static tpht_status_t tpht_flat_get_raw(tpht_table_t *t, const void *key, void *v
     prev = &t->heads[cloud];
     while (*prev) {
         uint8_t *entry = tpht_pool_deref(t, (uint64_t)cloud, *prev);
-        if (tpht_key_equal(t, entry + 1u, key)) {
-            if (value_out) memcpy(value_out, entry + 1u + t->key_size, t->value_size);
+        if (tpht_stored_key_equal(t, entry + 1u, key)) {
+            if (value_out && t->value_size) memcpy(value_out, entry + 1u + t->key_quotient_size, t->value_size);
             return TPHT_OK;
         }
         prev = entry;
@@ -507,18 +568,18 @@ static tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, const void *key,
         uint8_t i = tpht_ctz32(mask);
         uint8_t *slot = tpht_inline_entry(t, cloud, i);
         mask &= mask - 1u;
-        if (tpht_key_equal(t, slot, key)) {
+        if (tpht_stored_key_equal(t, slot, key)) {
             if (!replace) return TPHT_EXISTS;
-            memcpy(slot + t->key_size, value, t->value_size);
+            if (t->value_size) memcpy(slot + t->key_quotient_size, value, t->value_size);
             return TPHT_OK;
         }
     }
     prev = &t->heads[cloud];
     while (*prev) {
         entry = tpht_pool_deref(t, (uint64_t)cloud, *prev);
-        if (tpht_key_equal(t, entry + 1u, key)) {
+        if (tpht_stored_key_equal(t, entry + 1u, key)) {
             if (!replace) return TPHT_EXISTS;
-            memcpy(entry + 1u + t->key_size, value, t->value_size);
+            if (t->value_size) memcpy(entry + 1u + t->key_quotient_size, value, t->value_size);
             return TPHT_OK;
         }
         prev = entry;
@@ -527,8 +588,8 @@ static tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, const void *key,
     if (count < t->flat_inline_cap) {
         uint8_t *slot = tpht_inline_entry(t, cloud, count);
         fps[count] = fp;
-        memcpy(slot, key, t->key_size);
-        memcpy(slot + t->key_size, value, t->value_size);
+        tpht_write_quotient(t, slot, key);
+        if (t->value_size) memcpy(slot + t->key_quotient_size, value, t->value_size);
         t->flat_count[cloud] = (uint8_t)(count + 1u);
         t->size++;
         return TPHT_OK;
@@ -538,8 +599,8 @@ static tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, const void *key,
     if (!entry) return TPHT_FULL;
     entry[0] = t->heads[cloud];
     t->heads[cloud] = encoded;
-    memcpy(entry + 1u, key, t->key_size);
-    memcpy(entry + 1u + t->key_size, value, t->value_size);
+    tpht_write_quotient(t, entry + 1u, key);
+    if (t->value_size) memcpy(entry + 1u + t->key_quotient_size, value, t->value_size);
     t->size++;
     return TPHT_OK;
 }
@@ -556,12 +617,14 @@ static tpht_status_t tpht_flat_remove_raw(tpht_table_t *t, const void *key) {
         uint8_t i = tpht_ctz32(mask);
         uint8_t *slot = tpht_inline_entry(t, cloud, i);
         mask &= mask - 1u;
-        if (tpht_key_equal(t, slot, key)) {
+        if (tpht_stored_key_equal(t, slot, key)) {
             if (t->heads[cloud]) {
                 uint8_t encoded = t->heads[cloud];
                 uint8_t *entry = tpht_pool_deref(t, (uint64_t)cloud, encoded);
+                uint8_t moved_key[8];
                 t->heads[cloud] = entry[0];
-                fps[i] = tpht_fingerprint(t, entry + 1u);
+                tpht_rebuild_key(t, cloud, entry + 1u, moved_key);
+                fps[i] = tpht_fingerprint(t, moved_key);
                 memcpy(slot, entry + 1u, t->inline_entry_size);
                 tpht_pool_free(t, encoded, entry);
             } else {
@@ -581,7 +644,7 @@ static tpht_status_t tpht_flat_remove_raw(tpht_table_t *t, const void *key) {
     while (*prev) {
         uint8_t encoded = *prev;
         uint8_t *entry = tpht_pool_deref(t, (uint64_t)cloud, encoded);
-        if (tpht_key_equal(t, entry + 1u, key)) {
+        if (tpht_stored_key_equal(t, entry + 1u, key)) {
             *prev = entry[0];
             tpht_pool_free(t, encoded, entry);
             t->size--;
@@ -620,7 +683,10 @@ static tpht_status_t tpht_resize_locked(tpht_table_t *t, size_t new_capacity) {
             uint8_t *prev = &t->heads[i];
             while (*prev) {
                 uint8_t *entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev);
-                tpht_status_t st = tpht_raw_insert(&nt, entry + 1u, entry + 1u + t->key_size, 0);
+                uint8_t rebuilt_key[8];
+                tpht_status_t st;
+                tpht_rebuild_key(t, i, entry + 1u, rebuilt_key);
+                st = tpht_raw_insert(&nt, rebuilt_key, entry + 1u + t->key_quotient_size, 0);
                 if (st != TPHT_OK) {
                     tpht_free_storage(&nt);
                     return st == TPHT_FULL ? TPHT_NO_MEMORY : st;
@@ -634,7 +700,10 @@ static tpht_status_t tpht_resize_locked(tpht_table_t *t, size_t new_capacity) {
             uint8_t *prev;
             for (j = 0; j < t->flat_count[i]; ++j) {
                 uint8_t *slot = tpht_inline_entry(t, i, j);
-                tpht_status_t st = tpht_raw_insert(&nt, slot, slot + t->key_size, 0);
+                uint8_t rebuilt_key[8];
+                tpht_status_t st;
+                tpht_rebuild_key(t, i, slot, rebuilt_key);
+                st = tpht_raw_insert(&nt, rebuilt_key, slot + t->key_quotient_size, 0);
                 if (st != TPHT_OK) {
                     tpht_free_storage(&nt);
                     return st == TPHT_FULL ? TPHT_NO_MEMORY : st;
@@ -643,7 +712,10 @@ static tpht_status_t tpht_resize_locked(tpht_table_t *t, size_t new_capacity) {
             prev = &t->heads[i];
             while (*prev) {
                 uint8_t *entry = tpht_pool_deref(t, (uint64_t)i, *prev);
-                tpht_status_t st = tpht_raw_insert(&nt, entry + 1u, entry + 1u + t->key_size, 0);
+                uint8_t rebuilt_key[8];
+                tpht_status_t st;
+                tpht_rebuild_key(t, i, entry + 1u, rebuilt_key);
+                st = tpht_raw_insert(&nt, rebuilt_key, entry + 1u + t->key_quotient_size, 0);
                 if (st != TPHT_OK) {
                     tpht_free_storage(&nt);
                     return st == TPHT_FULL ? TPHT_NO_MEMORY : st;
@@ -656,6 +728,14 @@ static tpht_status_t tpht_resize_locked(tpht_table_t *t, size_t new_capacity) {
     tpht_free_storage(t);
     t->capacity = nt.capacity;
     t->size = nt.size;
+    t->key_size = nt.key_size;
+    t->value_size = nt.value_size;
+    t->key_quotient_size = nt.key_quotient_size;
+    t->inline_entry_size = nt.inline_entry_size;
+    t->pool_entry_size = nt.pool_entry_size;
+    t->key_bits = nt.key_bits;
+    t->base_bits = nt.base_bits;
+    t->base_mask = nt.base_mask;
     t->base_count = nt.base_count;
     t->heads = nt.heads;
     t->flat_count = nt.flat_count;
@@ -690,7 +770,7 @@ tpht_table_t *tpht_create(const tpht_config_t *config) {
     tpht_table_t *t;
     tpht_config_t c = config ? *config : tpht_default_config();
     if (c.variant != TPHT_CHAINED && c.variant != TPHT_FLATTEN) return NULL;
-    if (!tpht_valid_size(c.key_size) || !tpht_valid_size(c.value_size)) return NULL;
+    if (!tpht_valid_key_size(c.key_size) || !tpht_valid_value_size(c.value_size)) return NULL;
     if (c.bin_size == 0) c.bin_size = TPHT_DEFAULT_BIN_SIZE;
     if (c.bin_size > 127u) return NULL;
     if (c.initial_capacity == 0) c.initial_capacity = TPHT_MIN_CAPACITY;
@@ -797,6 +877,20 @@ tpht_status_t tpht_remove(tpht_table_t *table, const void *key) {
 
 size_t tpht_size(const tpht_table_t *table) { return table ? table->size : 0; }
 size_t tpht_capacity(const tpht_table_t *table) { return table ? table->capacity : 0; }
+size_t tpht_memory_bytes(const tpht_table_t *table) {
+    size_t bytes;
+    if (!table) return 0;
+    bytes = sizeof(*table);
+    bytes += table->base_count; /* heads */
+    bytes += table->pool.bin_count * (size_t)table->pool.bin_size * table->pool.entry_size;
+    bytes += table->pool.bin_count * 2u; /* pool cnt/head */
+    if (table->cfg.variant == TPHT_FLATTEN) {
+        bytes += table->base_count; /* flat_count */
+        bytes += table->base_count * (size_t)table->flat_inline_cap; /* fingerprints */
+        bytes += table->base_count * (size_t)table->flat_inline_cap * table->inline_entry_size;
+    }
+    return bytes;
+}
 tpht_variant_t tpht_get_variant(const tpht_table_t *table) { return table ? table->cfg.variant : 0; }
 tpht_threading_t tpht_get_threading(const tpht_table_t *table) { return table ? table->cfg.threading : 0; }
 tpht_resize_mode_t tpht_get_resize_mode(const tpht_table_t *table) { return table ? table->cfg.resize_mode : 0; }
