@@ -45,6 +45,8 @@
 #define TPHT_FLAT_CLOUD_BYTES 64u
 #define TPHT_FLAT_META_BYTES 8u
 #define TPHT_FLAT_FP_GROUP 32u
+#define TPHT_CHAINED_DEREF_LOAD_NUM 95u
+#define TPHT_CHAINED_DEREF_LOAD_DEN 100u
 
 typedef struct tpht_pool {
     uint8_t *entries;
@@ -84,6 +86,19 @@ static int tpht_valid_key_size(uint8_t n) { return n == 2u || n == 4u || n == 8u
 static int tpht_valid_value_size(uint8_t n) { return n == 2u || n == 4u || n == 8u; }
 
 static size_t tpht_max_size(size_t a, size_t b) { return a > b ? a : b; }
+
+static size_t tpht_ceil_mul_div(size_t x, size_t mul, size_t div) {
+    size_t q = x / div;
+    size_t r = x % div;
+    if (q > ((size_t)-1) / mul) return (size_t)-1;
+    q *= mul;
+    if (r) {
+        size_t add = (r * mul + div - 1u) / div;
+        if (q > (size_t)-1 - add) return (size_t)-1;
+        q += add;
+    }
+    return q;
+}
 
 static size_t tpht_pow2_ceil(size_t x) {
     size_t p = 1;
@@ -487,7 +502,8 @@ static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
         t->pool_entry_size = 1u + t->inline_entry_size;
         t->pool.entry_size = t->pool_entry_size;
         t->heads = (uint8_t *)calloc(t->base_count, 1);
-        overflow_slots = t->capacity + (size_t)t->pool.bin_size;
+        overflow_slots = tpht_ceil_mul_div(t->capacity, TPHT_CHAINED_DEREF_LOAD_DEN,
+                                           TPHT_CHAINED_DEREF_LOAD_NUM);
     } else {
         t->flat_inline_cap = TPHT_FLAT_FP_GROUP;
 
