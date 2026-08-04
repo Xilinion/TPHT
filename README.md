@@ -1,5 +1,11 @@
 # TPHT
 
+> **Development status: experimental / under active development.**
+>
+> TPHT is currently being rewritten and validated. APIs, internal layouts,
+> concurrency behavior, and benchmark results may still change. Do **not** treat
+> this repository as production-stable yet.
+
 Industrial C implementation of Tiny Pointer Hash Tables.  This repository keeps only the two intended variants from the academic TinyPtr codebase:
 
 - `chained-tpht`: derived from the `byte_array_chained_ht` idea.
