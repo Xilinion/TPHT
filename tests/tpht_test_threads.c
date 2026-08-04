@@ -21,12 +21,13 @@ static void *thread_insert(void *arg) {
     return NULL;
 }
 
-static void exercise_real_threads(tpht_variant_t variant) {
+static void exercise_real_threads(tpht_variant_t variant, tpht_resize_mode_t resize_mode,
+                                  size_t capacity) {
     enum { THREADS = 4, PER_THREAD = 500 };
     pthread_t threads[THREADS];
     thread_arg_t args[THREADS];
     tpht_table_t *t = tpht_test_make_table(variant, TPHT_CONCURRENT,
-                                           TPHT_RESIZABLE, 8, 8, 16);
+                                           resize_mode, 8, 8, capacity);
     int i;
     uint64_t j, out;
 
@@ -52,7 +53,8 @@ static void exercise_real_threads(tpht_variant_t variant) {
 
 void tpht_test_run_thread_module(void) {
 #ifdef TPHT_TEST_WITH_THREADS
-    exercise_real_threads(TPHT_CHAINED);
-    exercise_real_threads(TPHT_FLATTEN);
+    exercise_real_threads(TPHT_CHAINED, TPHT_FIXED, 4096);
+    exercise_real_threads(TPHT_CHAINED, TPHT_RESIZABLE, 16);
+    exercise_real_threads(TPHT_FLATTEN, TPHT_RESIZABLE, 16);
 #endif
 }

@@ -58,7 +58,7 @@ typedef struct tpht_pool {
 
 struct tpht_table {
     tpht_config_t cfg;
-    size_t size;
+    atomic_size_t size;
     size_t capacity;
 
     size_t key_size;
@@ -80,12 +80,44 @@ struct tpht_table {
 
     tpht_pool_t pool;
     atomic_flag lock;
+    atomic_flag *chain_locks;
+    atomic_flag *pool_locks;
+    size_t chain_lock_count;
+    size_t pool_lock_count;
 };
 
 static int tpht_valid_key_size(uint8_t n) { return n == 2u || n == 4u || n == 8u; }
 static int tpht_valid_value_size(uint8_t n) { return n == 2u || n == 4u || n == 8u; }
 
 static size_t tpht_max_size(size_t a, size_t b) { return a > b ? a : b; }
+
+static size_t tpht_size_load(const tpht_table_t *t) {
+    return atomic_load_explicit((atomic_size_t *)&t->size, memory_order_acquire);
+}
+
+static void tpht_size_store(tpht_table_t *t, size_t size) {
+    atomic_store_explicit(&t->size, size, memory_order_release);
+}
+
+static void tpht_size_inc(tpht_table_t *t) {
+    atomic_fetch_add_explicit(&t->size, 1u, memory_order_acq_rel);
+}
+
+static void tpht_size_dec(tpht_table_t *t) {
+    atomic_fetch_sub_explicit(&t->size, 1u, memory_order_acq_rel);
+}
+
+static int tpht_size_try_reserve(tpht_table_t *t) {
+    size_t cur = tpht_size_load(t);
+    while (cur < t->capacity) {
+        if (atomic_compare_exchange_weak_explicit(&t->size, &cur, cur + 1u,
+                                                  memory_order_acq_rel,
+                                                  memory_order_acquire)) {
+            return 1;
+        }
+    }
+    return 0;
+}
 
 static size_t tpht_ceil_mul_div(size_t x, size_t mul, size_t div) {
     size_t q = x / div;
@@ -401,6 +433,62 @@ static void tpht_unlock(tpht_table_t *t) {
     }
 }
 
+static void tpht_flag_lock(atomic_flag *lock) {
+    while (atomic_flag_test_and_set_explicit(lock, memory_order_acquire)) {
+    }
+}
+
+static void tpht_flag_unlock(atomic_flag *lock) {
+    atomic_flag_clear_explicit(lock, memory_order_release);
+}
+
+static int tpht_chained_fine_grained(const tpht_table_t *t) {
+    return t->cfg.variant == TPHT_CHAINED && t->cfg.threading == TPHT_CONCURRENT &&
+           t->cfg.resize_mode == TPHT_FIXED && t->chain_locks && t->pool_locks;
+}
+
+static void tpht_chain_lock_base(tpht_table_t *t, size_t base) {
+    if (tpht_chained_fine_grained(t)) tpht_flag_lock(&t->chain_locks[base % t->chain_lock_count]);
+}
+
+static void tpht_chain_unlock_base(tpht_table_t *t, size_t base) {
+    if (tpht_chained_fine_grained(t)) tpht_flag_unlock(&t->chain_locks[base % t->chain_lock_count]);
+}
+
+static void tpht_pool_lock_bin(tpht_table_t *t, size_t bin) {
+    if (t->pool_locks) tpht_flag_lock(&t->pool_locks[bin]);
+}
+
+static void tpht_pool_unlock_bin(tpht_table_t *t, size_t bin) {
+    if (t->pool_locks) tpht_flag_unlock(&t->pool_locks[bin]);
+}
+
+static void tpht_pool_lock_pair(tpht_table_t *t, size_t a, size_t b) {
+    if (!t->pool_locks) return;
+    if (a == b) {
+        tpht_pool_lock_bin(t, a);
+    } else if (a < b) {
+        tpht_pool_lock_bin(t, a);
+        tpht_pool_lock_bin(t, b);
+    } else {
+        tpht_pool_lock_bin(t, b);
+        tpht_pool_lock_bin(t, a);
+    }
+}
+
+static void tpht_pool_unlock_pair(tpht_table_t *t, size_t a, size_t b) {
+    if (!t->pool_locks) return;
+    if (a == b) {
+        tpht_pool_unlock_bin(t, a);
+    } else if (a < b) {
+        tpht_pool_unlock_bin(t, b);
+        tpht_pool_unlock_bin(t, a);
+    } else {
+        tpht_pool_unlock_bin(t, a);
+        tpht_pool_unlock_bin(t, b);
+    }
+}
+
 static uint8_t *tpht_pool_entry(tpht_pool_t *p, size_t bin, uint8_t pos) {
     return p->entries + ((bin * (size_t)p->bin_size + (size_t)pos) * p->entry_size);
 }
@@ -435,6 +523,8 @@ static uint8_t *tpht_pool_alloc(tpht_table_t *t, uint64_t deref_key, uint8_t *en
     uint8_t pos;
     uint8_t *entry;
 
+    tpht_pool_lock_pair(t, bin1, bin2);
+
     if (bin1 != bin2 && tpht_pool_count(&t->pool, bin1) > tpht_pool_count(&t->pool, bin2)) {
         bin = bin2;
         flag = 1;
@@ -442,7 +532,10 @@ static uint8_t *tpht_pool_alloc(tpht_table_t *t, uint64_t deref_key, uint8_t *en
 
     cnt = tpht_pool_count_ptr(&t->pool, bin);
     head = tpht_pool_head_ptr(&t->pool, bin);
-    if (*head >= t->pool.bin_size) return NULL;
+    if (*head >= t->pool.bin_size) {
+        tpht_pool_unlock_pair(t, bin1, bin2);
+        return NULL;
+    }
 
     pos = *head;
     entry = tpht_pool_entry(&t->pool, bin, pos);
@@ -450,6 +543,7 @@ static uint8_t *tpht_pool_alloc(tpht_table_t *t, uint64_t deref_key, uint8_t *en
     if (*head > t->pool.bin_size) *head = (uint8_t)(*head - (t->pool.bin_size + 1u));
     *cnt = (uint8_t)(*cnt + 1u);
     *encoded_out = (uint8_t)((pos + 1u) | (flag << 7u));
+    tpht_pool_unlock_pair(t, bin1, bin2);
     return entry;
 }
 
@@ -460,10 +554,12 @@ static void tpht_pool_free(tpht_table_t *t, uint8_t encoded_ptr, uint8_t *entry)
     uint8_t *cnt = tpht_pool_count_ptr(&t->pool, bin);
     uint8_t *head = tpht_pool_head_ptr(&t->pool, bin);
     (void)encoded_ptr;
+    tpht_pool_lock_bin(t, bin);
     entry[0] = (uint8_t)(*head + t->pool.bin_size - pos);
     if (entry[0] > t->pool.bin_size) entry[0] = (uint8_t)(entry[0] - (t->pool.bin_size + 1u));
     *head = pos;
     *cnt = (uint8_t)(*cnt - 1u);
+    tpht_pool_unlock_bin(t, bin);
 }
 
 static void tpht_free_storage(tpht_table_t *t) {
@@ -473,12 +569,18 @@ static void tpht_free_storage(tpht_table_t *t) {
     free(t->flat_entries);
     free(t->pool.entries);
     free(t->pool.cnt_head);
+    free(t->chain_locks);
+    free(t->pool_locks);
     t->heads = NULL;
     t->flat_count = NULL;
     t->flat_fp = NULL;
     t->flat_entries = NULL;
     t->pool.entries = NULL;
     t->pool.cnt_head = NULL;
+    t->chain_locks = NULL;
+    t->pool_locks = NULL;
+    t->chain_lock_count = 0;
+    t->pool_lock_count = 0;
 }
 
 static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
@@ -529,7 +631,22 @@ static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
     t->pool.entries = (uint8_t *)calloc(t->pool.bin_count * (size_t)t->pool.bin_size, t->pool.entry_size);
     t->pool.cnt_head = (uint8_t *)calloc(t->pool.bin_count * 2u, 1);
 
+    if (t->cfg.variant == TPHT_CHAINED && t->cfg.threading == TPHT_CONCURRENT &&
+        t->cfg.resize_mode == TPHT_FIXED) {
+        size_t i;
+        t->chain_lock_count = t->base_count;
+        t->pool_lock_count = t->pool.bin_count;
+        t->chain_locks = (atomic_flag *)malloc(t->chain_lock_count * sizeof(*t->chain_locks));
+        t->pool_locks = (atomic_flag *)malloc(t->pool_lock_count * sizeof(*t->pool_locks));
+        if (t->chain_locks && t->pool_locks) {
+            for (i = 0; i < t->chain_lock_count; ++i) atomic_flag_clear(&t->chain_locks[i]);
+            for (i = 0; i < t->pool_lock_count; ++i) atomic_flag_clear(&t->pool_locks[i]);
+        }
+    }
+
     if (!t->heads || !t->pool.entries || !t->pool.cnt_head ||
+        (t->cfg.variant == TPHT_CHAINED && t->cfg.threading == TPHT_CONCURRENT &&
+         t->cfg.resize_mode == TPHT_FIXED && (!t->chain_locks || !t->pool_locks)) ||
         (t->cfg.variant == TPHT_FLATTEN && (!t->flat_count || !t->flat_fp || !t->flat_entries))) {
         tpht_free_storage(t);
         return 0;
@@ -594,7 +711,7 @@ static tpht_status_t tpht_chained_insert_raw(tpht_table_t *t, const void *key,
     entry[0] = 0;
     tpht_write_quotient(t, entry + 1u, key);
     if (t->value_size) memcpy(entry + 1u + t->key_quotient_size, value, t->value_size);
-    t->size++;
+    tpht_size_inc(t);
     return TPHT_OK;
 }
 
@@ -625,7 +742,7 @@ static tpht_status_t tpht_chained_remove_raw(tpht_table_t *t, const void *key) {
     }
     *last_prev = 0;
     tpht_pool_free(t, last_encoded, last_entry);
-    t->size--;
+    tpht_size_dec(t);
     return TPHT_OK;
 }
 
@@ -697,7 +814,7 @@ static tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, const void *key,
         tpht_write_quotient(t, slot, key);
         if (t->value_size) memcpy(slot + t->key_quotient_size, value, t->value_size);
         t->flat_count[cloud] = (uint8_t)(count + 1u);
-        t->size++;
+        tpht_size_inc(t);
         return TPHT_OK;
     }
 
@@ -707,7 +824,7 @@ static tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, const void *key,
     t->heads[cloud] = encoded;
     tpht_write_quotient(t, entry + 1u, key);
     if (t->value_size) memcpy(entry + 1u + t->key_quotient_size, value, t->value_size);
-    t->size++;
+    tpht_size_inc(t);
     return TPHT_OK;
 }
 
@@ -741,7 +858,7 @@ static tpht_status_t tpht_flat_remove_raw(tpht_table_t *t, const void *key) {
                 }
                 t->flat_count[cloud] = last;
             }
-            t->size--;
+            tpht_size_dec(t);
             return TPHT_OK;
         }
     }
@@ -753,7 +870,7 @@ static tpht_status_t tpht_flat_remove_raw(tpht_table_t *t, const void *key) {
         if (tpht_stored_key_equal(t, entry + 1u, key)) {
             *prev = entry[0];
             tpht_pool_free(t, encoded, entry);
-            t->size--;
+            tpht_size_dec(t);
             return TPHT_OK;
         }
         prev = entry;
@@ -776,11 +893,116 @@ static tpht_status_t tpht_raw_remove(tpht_table_t *t, const void *key) {
                                           : tpht_flat_remove_raw(t, key);
 }
 
+static tpht_status_t tpht_chained_get_fine(tpht_table_t *t, const void *key, void *value_out) {
+    size_t base = tpht_chained_base(t, key);
+    tpht_status_t st;
+    tpht_chain_lock_base(t, base);
+    st = tpht_chained_get_raw(t, key, value_out);
+    tpht_chain_unlock_base(t, base);
+    return st;
+}
+
+static tpht_status_t tpht_chained_write_fine(tpht_table_t *t, const void *key,
+                                             const void *value, int replace) {
+    size_t base = tpht_chained_base(t, key);
+    uint8_t *prev = &t->heads[base];
+    uint8_t encoded;
+    uint8_t *entry;
+
+    tpht_chain_lock_base(t, base);
+    while (*prev) {
+        entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev);
+        if (tpht_stored_key_equal(t, entry + 1u, key)) {
+            if (!replace) {
+                tpht_chain_unlock_base(t, base);
+                return TPHT_EXISTS;
+            }
+            memcpy(entry + 1u + t->key_quotient_size, value, t->value_size);
+            tpht_chain_unlock_base(t, base);
+            return TPHT_OK;
+        }
+        prev = entry;
+    }
+
+    if (!tpht_size_try_reserve(t)) {
+        tpht_chain_unlock_base(t, base);
+        return TPHT_FULL;
+    }
+
+    entry = tpht_pool_alloc(t, (uint64_t)(uintptr_t)prev, &encoded);
+    if (!entry) {
+        tpht_size_dec(t);
+        tpht_chain_unlock_base(t, base);
+        return TPHT_FULL;
+    }
+
+    *prev = encoded;
+    entry[0] = 0;
+    tpht_write_quotient(t, entry + 1u, key);
+    memcpy(entry + 1u + t->key_quotient_size, value, t->value_size);
+    tpht_chain_unlock_base(t, base);
+    return TPHT_OK;
+}
+
+static tpht_status_t tpht_chained_update_fine(tpht_table_t *t, const void *key,
+                                              const void *value) {
+    size_t base = tpht_chained_base(t, key);
+    uint8_t *prev = &t->heads[base];
+    tpht_chain_lock_base(t, base);
+    while (*prev) {
+        uint8_t *entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev);
+        if (tpht_stored_key_equal(t, entry + 1u, key)) {
+            memcpy(entry + 1u + t->key_quotient_size, value, t->value_size);
+            tpht_chain_unlock_base(t, base);
+            return TPHT_OK;
+        }
+        prev = entry;
+    }
+    tpht_chain_unlock_base(t, base);
+    return TPHT_NOT_FOUND;
+}
+
+static tpht_status_t tpht_chained_remove_fine(tpht_table_t *t, const void *key) {
+    size_t base = tpht_chained_base(t, key);
+    uint8_t *prev = &t->heads[base];
+    uint8_t *target = NULL;
+    uint8_t *last_prev = NULL;
+    uint8_t *last_entry = NULL;
+    uint8_t last_encoded = 0;
+
+    tpht_chain_lock_base(t, base);
+    while (*prev) {
+        uint8_t encoded = *prev;
+        uint8_t *entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, encoded);
+        if (tpht_stored_key_equal(t, entry + 1u, key)) target = entry;
+        last_prev = prev;
+        last_entry = entry;
+        last_encoded = encoded;
+        prev = entry;
+    }
+    if (!target) {
+        tpht_chain_unlock_base(t, base);
+        return TPHT_NOT_FOUND;
+    }
+
+    if (target != last_entry) {
+        uint8_t target_next = target[0];
+        memcpy(target, last_entry, t->pool.entry_size);
+        target[0] = target_next;
+    }
+    *last_prev = 0;
+    tpht_pool_free(t, last_encoded, last_entry);
+    tpht_size_dec(t);
+    tpht_chain_unlock_base(t, base);
+    return TPHT_OK;
+}
+
 static tpht_status_t tpht_resize_locked(tpht_table_t *t, size_t new_capacity) {
     tpht_table_t nt;
     size_t i;
     memset(&nt, 0, sizeof(nt));
     nt.cfg = t->cfg;
+    atomic_init(&nt.size, 0);
     atomic_flag_clear(&nt.lock);
     if (!tpht_alloc_storage(&nt, new_capacity)) return TPHT_NO_MEMORY;
 
@@ -833,7 +1055,7 @@ static tpht_status_t tpht_resize_locked(tpht_table_t *t, size_t new_capacity) {
 
     tpht_free_storage(t);
     t->capacity = nt.capacity;
-    t->size = nt.size;
+    tpht_size_store(t, tpht_size_load(&nt));
     t->key_size = nt.key_size;
     t->value_size = nt.value_size;
     t->key_quotient_size = nt.key_quotient_size;
@@ -849,12 +1071,20 @@ static tpht_status_t tpht_resize_locked(tpht_table_t *t, size_t new_capacity) {
     t->flat_entries = nt.flat_entries;
     t->flat_inline_cap = nt.flat_inline_cap;
     t->pool = nt.pool;
+    t->chain_locks = nt.chain_locks;
+    t->pool_locks = nt.pool_locks;
+    t->chain_lock_count = nt.chain_lock_count;
+    t->pool_lock_count = nt.pool_lock_count;
     nt.heads = NULL;
     nt.flat_count = NULL;
     nt.flat_fp = NULL;
     nt.flat_entries = NULL;
     nt.pool.entries = NULL;
     nt.pool.cnt_head = NULL;
+    nt.chain_locks = NULL;
+    nt.pool_locks = NULL;
+    nt.chain_lock_count = 0;
+    nt.pool_lock_count = 0;
     return TPHT_OK;
 }
 
@@ -886,6 +1116,7 @@ tpht_table_t *tpht_create(const tpht_config_t *config) {
     t = (tpht_table_t *)calloc(1, sizeof(*t));
     if (!t) return NULL;
     t->cfg = c;
+    atomic_init(&t->size, 0);
     atomic_flag_clear(&t->lock);
     if (!tpht_alloc_storage(t, c.initial_capacity)) {
         free(t);
@@ -903,14 +1134,15 @@ void tpht_destroy(tpht_table_t *table) {
 tpht_status_t tpht_put(tpht_table_t *table, const void *key, const void *value) {
     tpht_status_t st;
     if (!table || !key || !value) return TPHT_INVALID;
+    if (tpht_chained_fine_grained(table)) return tpht_chained_write_fine(table, key, value, 1);
     tpht_lock(table);
-    if (table->cfg.resize_mode == TPHT_FIXED && table->size >= table->capacity &&
+    if (table->cfg.resize_mode == TPHT_FIXED && tpht_size_load(table) >= table->capacity &&
         tpht_raw_get(table, key, NULL) != TPHT_OK) {
         tpht_unlock(table);
         return TPHT_FULL;
     }
     if (table->cfg.resize_mode == TPHT_RESIZABLE &&
-        (double)(table->size + 1u) > (double)table->capacity * table->cfg.max_load_factor) {
+        (double)(tpht_size_load(table) + 1u) > (double)table->capacity * table->cfg.max_load_factor) {
         st = tpht_resize_locked(table, table->capacity * 2u);
         if (st != TPHT_OK) {
             tpht_unlock(table);
@@ -929,14 +1161,15 @@ tpht_status_t tpht_put(tpht_table_t *table, const void *key, const void *value) 
 tpht_status_t tpht_insert(tpht_table_t *table, const void *key, const void *value) {
     tpht_status_t st;
     if (!table || !key || !value) return TPHT_INVALID;
+    if (tpht_chained_fine_grained(table)) return tpht_chained_write_fine(table, key, value, 0);
     tpht_lock(table);
-    if (table->cfg.resize_mode == TPHT_FIXED && table->size >= table->capacity) {
+    if (table->cfg.resize_mode == TPHT_FIXED && tpht_size_load(table) >= table->capacity) {
         st = tpht_raw_get(table, key, NULL);
         tpht_unlock(table);
         return st == TPHT_OK ? TPHT_EXISTS : TPHT_FULL;
     }
     if (table->cfg.resize_mode == TPHT_RESIZABLE &&
-        (double)(table->size + 1u) > (double)table->capacity * table->cfg.max_load_factor) {
+        (double)(tpht_size_load(table) + 1u) > (double)table->capacity * table->cfg.max_load_factor) {
         st = tpht_resize_locked(table, table->capacity * 2u);
         if (st != TPHT_OK) {
             tpht_unlock(table);
@@ -956,6 +1189,7 @@ tpht_status_t tpht_update(tpht_table_t *table, const void *key, const void *valu
     tpht_status_t st;
     uint8_t old_value[8];
     if (!table || !key || !value) return TPHT_INVALID;
+    if (tpht_chained_fine_grained(table)) return tpht_chained_update_fine(table, key, value);
     tpht_lock(table);
     st = tpht_raw_get(table, key, old_value);
     if (st == TPHT_OK) st = tpht_raw_insert(table, key, value, 1);
@@ -966,6 +1200,7 @@ tpht_status_t tpht_update(tpht_table_t *table, const void *key, const void *valu
 tpht_status_t tpht_get(tpht_table_t *table, const void *key, void *value_out) {
     tpht_status_t st;
     if (!table || !key || !value_out) return TPHT_INVALID;
+    if (tpht_chained_fine_grained(table)) return tpht_chained_get_fine(table, key, value_out);
     tpht_lock(table);
     st = tpht_raw_get(table, key, value_out);
     tpht_unlock(table);
@@ -975,13 +1210,14 @@ tpht_status_t tpht_get(tpht_table_t *table, const void *key, void *value_out) {
 tpht_status_t tpht_remove(tpht_table_t *table, const void *key) {
     tpht_status_t st;
     if (!table || !key) return TPHT_INVALID;
+    if (tpht_chained_fine_grained(table)) return tpht_chained_remove_fine(table, key);
     tpht_lock(table);
     st = tpht_raw_remove(table, key);
     tpht_unlock(table);
     return st;
 }
 
-size_t tpht_size(const tpht_table_t *table) { return table ? table->size : 0; }
+size_t tpht_size(const tpht_table_t *table) { return table ? tpht_size_load(table) : 0; }
 size_t tpht_capacity(const tpht_table_t *table) { return table ? table->capacity : 0; }
 size_t tpht_memory_bytes(const tpht_table_t *table) {
     size_t bytes;
@@ -990,6 +1226,8 @@ size_t tpht_memory_bytes(const tpht_table_t *table) {
     bytes += table->base_count; /* heads */
     bytes += table->pool.bin_count * (size_t)table->pool.bin_size * table->pool.entry_size;
     bytes += table->pool.bin_count * 2u; /* pool cnt/head */
+    bytes += table->chain_lock_count * sizeof(*table->chain_locks);
+    bytes += table->pool_lock_count * sizeof(*table->pool_locks);
     if (table->cfg.variant == TPHT_FLATTEN) {
         bytes += table->base_count; /* flat_count */
         bytes += table->base_count * (size_t)table->flat_inline_cap; /* fingerprints */
