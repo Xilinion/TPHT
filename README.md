@@ -14,6 +14,7 @@ The code is designed to be copied directly into another project: copy `tpht.h` a
 - Fixed-capacity and resizable modes.
 - Resizing uses normal capacity doubling.
 - Key and value sizes can independently be 2, 4, or 8 bytes.
+- XXH64 hashing, embedded directly for copy-paste portability.
 - SIMD optimized fingerprint matching for `flatten-tpht` when available.
 - Safe scalar fallback when SIMD is disabled or unavailable.
 
@@ -143,3 +144,8 @@ The tests are split into controlled-granularity modules:
 - `tests/tpht_test_deterministic.c`: deterministic insert/get/update/remove/resize checks.
 - `tests/tpht_test_random_model.c`: randomized model-check tests.
 - `tests/tpht_test_threads.c`: pthread-backed concurrent stress tests when enabled.
+
+## Acknowledgements
+
+- Tiny Pointer Hash Tables / TinyPtr: source design inspiration for the chained and flatten variants.
+- xxHash / XXH64 by Yann Collet: TPHT embeds a small dependency-free XXH64 implementation so users can still copy only `tpht.h` and `tpht.c`. xxHash is BSD 2-Clause licensed: https://github.com/Cyan4973/xxHash

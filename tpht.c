@@ -115,27 +115,117 @@ static void tpht_write_le(void *p, size_t n, uint64_t x) {
     for (i = 0; i < n; ++i) b[i] = (uint8_t)(x >> (8u * i));
 }
 
-static uint64_t tpht_mix64(uint64_t x) {
-    x ^= x >> 30;
-    x *= UINT64_C(0xbf58476d1ce4e5b9);
-    x ^= x >> 27;
-    x *= UINT64_C(0x94d049bb133111eb);
-    x ^= x >> 31;
-    return x;
+/*
+ * Embedded XXH64 implementation for copy-paste portability.
+ * Algorithm: xxHash / XXH64 by Yann Collet, BSD 2-Clause licensed.
+ * Project: https://github.com/Cyan4973/xxHash
+ * This file keeps a small local implementation instead of depending on
+ * libxxhash so TPHT remains a two-file C library (tpht.h + tpht.c).
+ */
+static uint32_t tpht_read32_le(const void *p) {
+    const uint8_t *b = (const uint8_t *)p;
+    return ((uint32_t)b[0]) | ((uint32_t)b[1] << 8) |
+           ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+
+static uint64_t tpht_read64_le(const void *p) {
+    const uint8_t *b = (const uint8_t *)p;
+    return ((uint64_t)b[0]) | ((uint64_t)b[1] << 8) |
+           ((uint64_t)b[2] << 16) | ((uint64_t)b[3] << 24) |
+           ((uint64_t)b[4] << 32) | ((uint64_t)b[5] << 40) |
+           ((uint64_t)b[6] << 48) | ((uint64_t)b[7] << 56);
+}
+
+static uint64_t tpht_xxh64_rotl(uint64_t x, unsigned r) {
+    return (x << r) | (x >> (64u - r));
+}
+
+static uint64_t tpht_xxh64_round(uint64_t acc, uint64_t input) {
+    acc += input * UINT64_C(0xc2b2ae3d27d4eb4f);
+    acc = tpht_xxh64_rotl(acc, 31);
+    acc *= UINT64_C(0x9e3779b185ebca87);
+    return acc;
+}
+
+static uint64_t tpht_xxh64_merge_round(uint64_t acc, uint64_t val) {
+    val = tpht_xxh64_round(0, val);
+    acc ^= val;
+    acc = acc * UINT64_C(0x9e3779b185ebca87) + UINT64_C(0x85ebca77c2b2ae63);
+    return acc;
+}
+
+static uint64_t tpht_xxh64_avalanche(uint64_t h) {
+    h ^= h >> 33;
+    h *= UINT64_C(0xc2b2ae3d27d4eb4f);
+    h ^= h >> 29;
+    h *= UINT64_C(0x165667b19e3779f9);
+    h ^= h >> 32;
+    return h;
 }
 
 static uint64_t tpht_hash_bytes(const void *data, size_t len, uint64_t seed) {
     const uint8_t *p = (const uint8_t *)data;
-    uint64_t h = seed ^ UINT64_C(0x9e3779b97f4a7c15) ^ (uint64_t)len;
-    size_t i;
-    for (i = 0; i < len; ++i) {
-        h ^= (uint64_t)p[i] + UINT64_C(0x9e3779b97f4a7c15) + (h << 6) + (h >> 2);
+    const uint8_t *end = p + len;
+    uint64_t h;
+
+    if (len >= 32u) {
+        const uint8_t *limit = end - 32u;
+        uint64_t v1 = seed + UINT64_C(0x9e3779b185ebca87) + UINT64_C(0xc2b2ae3d27d4eb4f);
+        uint64_t v2 = seed + UINT64_C(0xc2b2ae3d27d4eb4f);
+        uint64_t v3 = seed;
+        uint64_t v4 = seed - UINT64_C(0x9e3779b185ebca87);
+
+        do {
+            v1 = tpht_xxh64_round(v1, tpht_read64_le(p));
+            p += 8;
+            v2 = tpht_xxh64_round(v2, tpht_read64_le(p));
+            p += 8;
+            v3 = tpht_xxh64_round(v3, tpht_read64_le(p));
+            p += 8;
+            v4 = tpht_xxh64_round(v4, tpht_read64_le(p));
+            p += 8;
+        } while (p <= limit);
+
+        h = tpht_xxh64_rotl(v1, 1) + tpht_xxh64_rotl(v2, 7) +
+            tpht_xxh64_rotl(v3, 12) + tpht_xxh64_rotl(v4, 18);
+        h = tpht_xxh64_merge_round(h, v1);
+        h = tpht_xxh64_merge_round(h, v2);
+        h = tpht_xxh64_merge_round(h, v3);
+        h = tpht_xxh64_merge_round(h, v4);
+    } else {
+        h = seed + UINT64_C(0x27d4eb2f165667c5);
     }
-    return tpht_mix64(h);
+
+    h += (uint64_t)len;
+
+    while (p + 8u <= end) {
+        uint64_t k1 = tpht_xxh64_round(0, tpht_read64_le(p));
+        h ^= k1;
+        h = tpht_xxh64_rotl(h, 27) * UINT64_C(0x9e3779b185ebca87) +
+            UINT64_C(0x85ebca77c2b2ae63);
+        p += 8;
+    }
+
+    if (p + 4u <= end) {
+        h ^= (uint64_t)tpht_read32_le(p) * UINT64_C(0x9e3779b185ebca87);
+        h = tpht_xxh64_rotl(h, 23) * UINT64_C(0xc2b2ae3d27d4eb4f) +
+            UINT64_C(0x165667b19e3779f9);
+        p += 4;
+    }
+
+    while (p < end) {
+        h ^= (uint64_t)(*p) * UINT64_C(0x27d4eb2f165667c5);
+        h = tpht_xxh64_rotl(h, 11) * UINT64_C(0x9e3779b185ebca87);
+        ++p;
+    }
+
+    return tpht_xxh64_avalanche(h);
 }
 
 static uint64_t tpht_hash_word(uint64_t x, uint64_t seed) {
-    return tpht_mix64(x ^ seed ^ UINT64_C(0x517cc1b727220a95));
+    uint8_t b[8];
+    tpht_write_le(b, sizeof(b), x);
+    return tpht_hash_bytes(b, sizeof(b), seed);
 }
 
 static uint64_t tpht_key_word(const tpht_table_t *t, const void *key) {
