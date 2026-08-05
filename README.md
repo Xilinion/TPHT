@@ -3,8 +3,10 @@
 > **Development status: experimental / under active development.**
 >
 > TPHT is currently being rewritten and validated. APIs, internal layouts,
-> concurrency behavior, and benchmark results may still change. Do **not** treat
-> this repository as production-stable yet.
+> concurrency behavior, and benchmark results may still change. At this stage,
+> correctness is **not guaranteed**, and performance is even less so. Do **not**
+> treat this repository as production-stable yet. The current target for a
+> stabilized implementation is around late August.
 
 Industrial C implementation of Tiny Pointer Hash Tables.  This repository keeps only the two intended variants from the academic TinyPtr codebase:
 
