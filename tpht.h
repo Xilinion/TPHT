@@ -65,8 +65,10 @@ typedef struct tpht_config {
 
     /*
      * Cooperative resize work units for concurrent chained resizable tables.
-     * 0 selects an automatic value. Larger values expose more resize work for
-     * helper threads, but add slightly more scheduling overhead.
+     * This is a target number of migration chunks, not a chunk size. 0 selects
+     * an automatic value that targets about 64 old buckets per chunk. Larger
+     * values expose more work units for helper threads, but add slightly more
+     * scheduling overhead.
      */
     size_t resize_strides;
 } tpht_config_t;

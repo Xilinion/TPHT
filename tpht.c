@@ -47,6 +47,7 @@
 #define TPHT_FLAT_FP_GROUP 32u
 #define TPHT_CHAINED_DEREF_LOAD_NUM 95u
 #define TPHT_CHAINED_DEREF_LOAD_DEN 100u
+#define TPHT_DEFAULT_RESIZE_STRIDE_BUCKETS 64u
 
 typedef struct tpht_pool {
     uint8_t *entries;
@@ -66,6 +67,7 @@ typedef struct tpht_retired_storage {
     atomic_flag *chain_locks;
     atomic_flag *pool_locks;
     uint8_t *resize_migrated;
+    tpht_table_t *resize_descriptor;
     struct tpht_retired_storage *next;
 } tpht_retired_storage_t;
 
@@ -469,7 +471,7 @@ static void tpht_flag_unlock(atomic_flag *lock) {
 
 static int tpht_chained_fine_grained(const tpht_table_t *t) {
     return t->cfg.variant == TPHT_CHAINED && t->cfg.threading == TPHT_CONCURRENT &&
-           t->cfg.resize_mode == TPHT_FIXED && t->chain_locks && t->pool_locks;
+           t->chain_locks && t->pool_locks;
 }
 
 static void tpht_chain_lock_base(tpht_table_t *t, size_t base) {
@@ -600,6 +602,7 @@ static void tpht_free_storage(tpht_table_t *t) {
         free(r->chain_locks);
         free(r->pool_locks);
         free(r->resize_migrated);
+        free(r->resize_descriptor);
         free(r);
         r = next;
     }
@@ -946,13 +949,16 @@ static tpht_status_t tpht_chained_write_fine(tpht_table_t *t, const void *key,
                                              const void *value, int replace);
 static tpht_status_t tpht_chained_get_fine(tpht_table_t *t, const void *key,
                                            void *value_out);
+static void tpht_chained_resize_quiesce_and_commit(tpht_table_t *t);
 
 static int tpht_chained_resize_active(tpht_table_t *t) {
     return atomic_load_explicit(&t->resize_active, memory_order_acquire) != 0;
 }
 
 static void tpht_op_enter(tpht_table_t *t) {
+    tpht_flag_lock(&t->resize_start_lock);
     atomic_fetch_add_explicit(&t->active_ops, 1u, memory_order_acq_rel);
+    tpht_flag_unlock(&t->resize_start_lock);
 }
 
 static void tpht_op_exit(tpht_table_t *t) {
@@ -961,6 +967,7 @@ static void tpht_op_exit(tpht_table_t *t) {
 
 static int tpht_chained_resize_start(tpht_table_t *t, size_t new_capacity) {
     tpht_table_t *nt;
+    size_t requested_strides;
     if (tpht_chained_resize_active(t)) return 1;
 
     tpht_flag_lock(&t->resize_start_lock);
@@ -1000,6 +1007,14 @@ static int tpht_chained_resize_start(tpht_table_t *t, size_t new_capacity) {
     }
 
     t->resize_target = nt;
+    requested_strides = t->cfg.resize_strides
+                            ? t->cfg.resize_strides
+                            : ((t->base_count + TPHT_DEFAULT_RESIZE_STRIDE_BUCKETS - 1u) /
+                               TPHT_DEFAULT_RESIZE_STRIDE_BUCKETS);
+    if (requested_strides == 0) requested_strides = 1;
+    if (requested_strides > t->base_count) requested_strides = t->base_count;
+    t->resize_stride_size = (t->base_count + requested_strides - 1u) / requested_strides;
+    t->resize_stride_count = (t->base_count + t->resize_stride_size - 1u) / t->resize_stride_size;
     atomic_store_explicit(&t->resize_next_stride, 0, memory_order_release);
     atomic_store_explicit(&t->resize_done_strides, 0, memory_order_release);
     atomic_flag_clear(&t->resize_commit_lock);
@@ -1021,9 +1036,11 @@ static void tpht_chained_resize_commit(tpht_table_t *t) {
     uint8_t *old_migrated;
     tpht_retired_storage_t *retired;
 
-    if (atomic_load_explicit(&t->resize_done_strides, memory_order_acquire) < t->base_count) return;
+    if (atomic_load_explicit(&t->resize_done_strides, memory_order_acquire) < t->resize_stride_count) return;
     if (atomic_flag_test_and_set_explicit(&t->resize_commit_lock, memory_order_acquire)) return;
+    tpht_flag_lock(&t->resize_start_lock);
     if (atomic_load_explicit(&t->active_ops, memory_order_acquire) > 1u) {
+        tpht_flag_unlock(&t->resize_start_lock);
         atomic_flag_clear_explicit(&t->resize_commit_lock, memory_order_release);
         return;
     }
@@ -1031,6 +1048,7 @@ static void tpht_chained_resize_commit(tpht_table_t *t) {
     nt = t->resize_target;
     if (!nt) {
         atomic_store_explicit(&t->resize_active, 0, memory_order_release);
+        tpht_flag_unlock(&t->resize_start_lock);
         atomic_flag_clear_explicit(&t->resize_commit_lock, memory_order_release);
         return;
     }
@@ -1089,11 +1107,13 @@ static void tpht_chained_resize_commit(tpht_table_t *t) {
         retired->chain_locks = old_chain_locks;
         retired->pool_locks = old_pool_locks;
         retired->resize_migrated = old_migrated;
+        retired->resize_descriptor = nt;
         retired->next = t->retired;
         t->retired = retired;
     }
 
     atomic_store_explicit(&t->resize_active, 0, memory_order_release);
+    tpht_flag_unlock(&t->resize_start_lock);
     atomic_flag_clear_explicit(&t->resize_commit_lock, memory_order_release);
 }
 
@@ -1114,34 +1134,38 @@ static void tpht_chained_resize_migrate_bucket(tpht_table_t *t, size_t base) {
             prev = entry;
         }
         t->resize_migrated[base] = 1u;
-        atomic_fetch_add_explicit(&t->resize_done_strides, 1u, memory_order_acq_rel);
     }
     tpht_chain_unlock_base(t, base);
+}
+
+static void tpht_chained_resize_migrate_stride(tpht_table_t *t, size_t stride) {
+    size_t begin = stride * t->resize_stride_size;
+    size_t end = begin + t->resize_stride_size;
+    size_t base;
+    if (begin >= t->base_count) return;
+    if (end > t->base_count) end = t->base_count;
+    for (base = begin; base < end && tpht_chained_resize_active(t); ++base) {
+        tpht_chained_resize_migrate_bucket(t, base);
+    }
+    atomic_fetch_add_explicit(&t->resize_done_strides, 1u, memory_order_acq_rel);
     tpht_chained_resize_commit(t);
 }
 
 static void tpht_chained_resize_finish_all(tpht_table_t *t) {
-    size_t base_count = t->base_count;
-    size_t i;
-    for (i = 0; i < base_count && tpht_chained_resize_active(t); ++i) {
-        tpht_chained_resize_migrate_bucket(t, i);
+    size_t stride;
+    while (tpht_chained_resize_active(t) &&
+           (stride = atomic_fetch_add_explicit(&t->resize_next_stride, 1u,
+                                               memory_order_acq_rel)) < t->resize_stride_count) {
+        tpht_chained_resize_migrate_stride(t, stride);
     }
-    tpht_chained_resize_commit(t);
+    if (tpht_chained_resize_active(t) &&
+        atomic_load_explicit(&t->resize_done_strides, memory_order_acquire) >= t->resize_stride_count) {
+        tpht_chained_resize_quiesce_and_commit(t);
+    }
 }
 
 static int tpht_chained_resize_needed(tpht_table_t *t) {
     return (double)(tpht_size_load(t) + 1u) > (double)t->capacity * t->cfg.max_load_factor;
-}
-
-static int tpht_chained_resize_target_near_full(tpht_table_t *t, size_t extra) {
-    tpht_table_t *nt = t->resize_target;
-    if (!nt) return 0;
-    return (double)(tpht_size_load(nt) + extra) > (double)nt->capacity * nt->cfg.max_load_factor;
-}
-
-static int tpht_chained_resize_waiting_for_quiescence(tpht_table_t *t) {
-    return atomic_load_explicit(&t->resize_done_strides, memory_order_acquire) >= t->base_count &&
-           atomic_load_explicit(&t->active_ops, memory_order_acquire) > 1u;
 }
 
 static void tpht_chained_resize_quiesce_and_commit(tpht_table_t *t) {
@@ -1163,28 +1187,7 @@ static tpht_status_t tpht_chained_resizable_write_fine(tpht_table_t *t, const vo
     tpht_status_t st;
     for (;;) {
         if (tpht_chained_resize_active(t)) {
-            size_t base = tpht_chained_base(t, key);
-            tpht_table_t *nt;
-            int was_present = 0;
-            if (tpht_chained_resize_waiting_for_quiescence(t)) {
-                tpht_chained_resize_quiesce_and_commit(t);
-                continue;
-            }
-            if (tpht_chained_resize_target_near_full(t, 1u) &&
-                !tpht_chained_resize_waiting_for_quiescence(t)) {
-                tpht_chained_resize_finish_all(t);
-                continue;
-            }
-            tpht_chained_resize_migrate_bucket(t, base);
-            nt = t->resize_target;
-            if (nt) {
-                was_present = tpht_chained_get_fine(nt, key, NULL) == TPHT_OK;
-                st = tpht_chained_write_fine(nt, key, value, replace);
-                if (st == TPHT_OK && !was_present) tpht_size_inc(t);
-                tpht_chained_resize_commit(t);
-                if (st != TPHT_FULL) return st;
-                tpht_chained_resize_finish_all(t);
-            }
+            tpht_chained_resize_finish_all(t);
             continue;
         }
         if (tpht_chained_resize_needed(t)) {
@@ -1207,24 +1210,7 @@ static tpht_status_t tpht_chained_get_fine(tpht_table_t *t, const void *key, voi
     tpht_status_t st;
 retry:
     if (tpht_chained_resize_active(t)) {
-        tpht_table_t *nt;
-        base = tpht_chained_base(t, key);
-        if (tpht_chained_resize_waiting_for_quiescence(t)) {
-            tpht_chained_resize_quiesce_and_commit(t);
-            goto retry;
-        }
-        if (tpht_chained_resize_target_near_full(t, 0u) &&
-            !tpht_chained_resize_waiting_for_quiescence(t)) {
-            tpht_chained_resize_finish_all(t);
-            goto retry;
-        }
-        tpht_chained_resize_migrate_bucket(t, base);
-        nt = t->resize_target;
-        if (nt) {
-            st = tpht_chained_get_fine(nt, key, value_out);
-            tpht_chained_resize_commit(t);
-            return st;
-        }
+        tpht_chained_resize_finish_all(t);
         goto retry;
     }
     base = tpht_chained_base(t, key);
@@ -1247,17 +1233,7 @@ static tpht_status_t tpht_chained_write_fine(tpht_table_t *t, const void *key,
 
 retry:
     if (tpht_chained_resize_active(t)) {
-        base = tpht_chained_base(t, key);
-        if (tpht_chained_resize_waiting_for_quiescence(t)) {
-            tpht_chained_resize_quiesce_and_commit(t);
-            goto retry;
-        }
-        if (tpht_chained_resize_target_near_full(t, 1u) &&
-            !tpht_chained_resize_waiting_for_quiescence(t)) {
-            tpht_chained_resize_finish_all(t);
-            goto retry;
-        }
-        tpht_chained_resize_migrate_bucket(t, base);
+        tpht_chained_resize_finish_all(t);
         goto retry;
     }
     base = tpht_chained_base(t, key);
@@ -1307,24 +1283,7 @@ static tpht_status_t tpht_chained_update_fine(tpht_table_t *t, const void *key,
     uint8_t *prev = &t->heads[base];
 retry:
     if (tpht_chained_resize_active(t)) {
-        tpht_table_t *nt;
-        base = tpht_chained_base(t, key);
-        if (tpht_chained_resize_waiting_for_quiescence(t)) {
-            tpht_chained_resize_quiesce_and_commit(t);
-            goto retry;
-        }
-        if (tpht_chained_resize_target_near_full(t, 0u) &&
-            !tpht_chained_resize_waiting_for_quiescence(t)) {
-            tpht_chained_resize_finish_all(t);
-            goto retry;
-        }
-        tpht_chained_resize_migrate_bucket(t, base);
-        nt = t->resize_target;
-        if (nt) {
-            tpht_status_t st = tpht_chained_update_fine(nt, key, value);
-            tpht_chained_resize_commit(t);
-            return st;
-        }
+        tpht_chained_resize_finish_all(t);
         goto retry;
     }
     base = tpht_chained_base(t, key);
@@ -1357,25 +1316,7 @@ static tpht_status_t tpht_chained_remove_fine(tpht_table_t *t, const void *key) 
 
 retry:
     if (tpht_chained_resize_active(t)) {
-        tpht_table_t *nt;
-        base = tpht_chained_base(t, key);
-        if (tpht_chained_resize_waiting_for_quiescence(t)) {
-            tpht_chained_resize_quiesce_and_commit(t);
-            goto retry;
-        }
-        if (tpht_chained_resize_target_near_full(t, 0u) &&
-            !tpht_chained_resize_waiting_for_quiescence(t)) {
-            tpht_chained_resize_finish_all(t);
-            goto retry;
-        }
-        tpht_chained_resize_migrate_bucket(t, base);
-        nt = t->resize_target;
-        if (nt) {
-            tpht_status_t st = tpht_chained_remove_fine(nt, key);
-            if (st == TPHT_OK) tpht_size_dec(t);
-            tpht_chained_resize_commit(t);
-            return st;
-        }
+        tpht_chained_resize_finish_all(t);
         goto retry;
     }
     base = tpht_chained_base(t, key);
