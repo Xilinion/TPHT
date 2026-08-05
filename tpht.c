@@ -1,3 +1,11 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Xilin Tang and TPHT contributors
+ *
+ * TPHT is an independent industrial C implementation inspired by the TinyPtr
+ * hash-table designs. This file also embeds a compact XXH64 implementation;
+ * see the local xxHash attribution comment and README.md for details.
+ */
+
 #include "tpht.h"
 
 #include <stdatomic.h>
