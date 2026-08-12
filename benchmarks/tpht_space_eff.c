@@ -4,17 +4,12 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-static void put_le(uint8_t *dst, uint8_t size, uint64_t x) {
-    uint8_t i;
-    for (i = 0; i < size; ++i) dst[i] = (uint8_t)(x >> (8u * i));
-}
-
 static const char *variant_name(tpht_variant_t variant) {
     return variant == TPHT_CHAINED ? "chained-tpht" : "flatten-tpht";
 }
 
-static tpht_table_t *make_table(tpht_variant_t variant, size_t capacity,
-                                uint8_t key_size, uint8_t value_size) {
+static tpht_table_t *make_table(tpht_variant_t variant, size_t capacity, uint8_t key_size,
+                                uint8_t value_size) {
     tpht_config_t c = tpht_default_config();
     c.variant = variant;
     c.threading = TPHT_SEQUENTIAL;
@@ -30,7 +25,6 @@ static int run_one(tpht_variant_t variant, uint8_t key_size, uint8_t value_size,
                    double load_factor, size_t target_entries) {
     size_t capacity = (size_t)((double)target_entries / load_factor + 0.999999);
     tpht_table_t *table = make_table(variant, capacity, key_size, value_size);
-    uint8_t key[8], value[8];
     size_t inserted = 0;
     size_t memory_bytes;
     size_t payload_bytes;
@@ -41,8 +35,8 @@ static int run_one(tpht_variant_t variant, uint8_t key_size, uint8_t value_size,
     if (!table) return 1;
 
     for (i = 0; i < target_entries; ++i) {
-        put_le(key, key_size, i + 1u);
-        put_le(value, value_size, (i + 1u) * UINT64_C(11400714819323198485));
+        uint64_t key = (uint64_t)(i + 1u);
+        uint64_t value = (uint64_t)(i + 1u) * UINT64_C(2654435761);
         if (tpht_put(table, key, value) != TPHT_OK) break;
         inserted++;
     }
@@ -65,11 +59,11 @@ int main(int argc, char **argv) {
     static const double load_factors[] = {
         0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50,
         0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 0.99};
-    static const uint8_t key_sizes[] = {4u, 8u};
-    static const uint8_t value_sizes[] = {4u, 8u};
     static const tpht_variant_t variants[] = {TPHT_CHAINED, TPHT_FLATTEN};
+    static const uint8_t key_sizes[] = {4u, 8u};
+    static const uint8_t value_sizes[] = {1u, 2u, 4u, 8u};
     size_t target_entries = 200000;
-    size_t vi, si, li;
+    size_t vi, ki, si, li;
     int rc = 0;
 
     if (argc > 1) {
@@ -79,14 +73,13 @@ int main(int argc, char **argv) {
 
     puts("variant,key_bits,value_bits,target_load,capacity,inserted,payload_bytes,memory_bytes,actual_load,space_efficiency,memory_mb");
     for (vi = 0; vi < sizeof(variants) / sizeof(variants[0]); ++vi) {
-        for (si = 0; si < sizeof(key_sizes) / sizeof(key_sizes[0]); ++si) {
-            size_t vsi;
-            for (vsi = 0; vsi < sizeof(value_sizes) / sizeof(value_sizes[0]); ++vsi) {
-            for (li = 0; li < sizeof(load_factors) / sizeof(load_factors[0]); ++li) {
-                int one = run_one(variants[vi], key_sizes[si], value_sizes[vsi],
-                                  load_factors[li], target_entries);
-                if (one != 0) rc = one;
-            }
+        for (ki = 0; ki < sizeof(key_sizes) / sizeof(key_sizes[0]); ++ki) {
+            for (si = 0; si < sizeof(value_sizes) / sizeof(value_sizes[0]); ++si) {
+                for (li = 0; li < sizeof(load_factors) / sizeof(load_factors[0]); ++li) {
+                    int one = run_one(variants[vi], key_sizes[ki], value_sizes[si],
+                                      load_factors[li], target_entries);
+                    if (one != 0) rc = one;
+                }
             }
         }
     }
