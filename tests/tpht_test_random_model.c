@@ -5,34 +5,32 @@
 
 static void run_random_model_case(const tpht_test_case_t *tc) {
     enum { MODEL_CAP = 4096, OPS = 8000 };
-    tpht_table_t *t = tpht_test_make_table(tc, tc->resize_mode == TPHT_RESIZABLE ? 8u : MODEL_CAP);
+    tpht_test_table_t t =
+        tpht_test_make_table(tc, tc->resize_mode == TPHT_RESIZABLE ? 8u : MODEL_CAP);
     tpht_test_model_entry_t model[MODEL_CAP];
-    uint64_t rng = UINT64_C(0xf00d123456789abc) ^ ((uint64_t)tc->variant << 8u) ^
-                   ((uint64_t)tc->threading << 16u) ^ ((uint64_t)tc->resize_mode << 24u) ^
-                   ((uint64_t)tc->key_size << 32u) ^ ((uint64_t)tc->value_size << 40u);
+    uint64_t rng = UINT64_C(0xf00d123456789abc) ^ ((uint64_t)tc->kind << 8u) ^
+                   ((uint64_t)tc->concurrent << 16u) ^ ((uint64_t)tc->resize_mode << 24u) ^
+                   ((uint64_t)tc->value_size << 40u);
     int op;
 
     memset(model, 0, sizeof(model));
-    assert(t != NULL);
+    assert(t.handle != NULL);
 
     for (op = 0; op < OPS; ++op) {
-        uint64_t key = tpht_test_trunc_to(tpht_test_next_rand(&rng) % 4096u, tc->key_size);
+        uint64_t key = tpht_test_next_rand(&rng) % 4096u;
         uint64_t val = tpht_test_trunc_to(tpht_test_next_rand(&rng), tc->value_size);
         uint64_t out;
         size_t idx = tpht_test_model_find(model, MODEL_CAP, key);
         int action = (int)(tpht_test_next_rand(&rng) % 5u);
 
         if (action <= 1) {
-            tpht_status_t st = tpht_put(t, key, val);
+            tpht_status_t st = t.put(t.handle, key, val);
             assert(st == TPHT_OK || (tc->resize_mode == TPHT_FIXED && st == TPHT_FULL));
             if (st == TPHT_OK) {
                 if (idx == MODEL_CAP) {
                     size_t i;
                     for (i = 0; i < MODEL_CAP; ++i) {
-                        if (!model[i].live) {
-                            idx = i;
-                            break;
-                        }
+                        if (!model[i].live) { idx = i; break; }
                     }
                 }
                 assert(idx != MODEL_CAP);
@@ -41,15 +39,15 @@ static void run_random_model_case(const tpht_test_case_t *tc) {
                 model[idx].live = 1;
             }
         } else if (action == 2) {
-            tpht_status_t st = tpht_update(t, key, val);
+            tpht_status_t st = t.update(t.handle, key, val);
             assert(st == (idx == MODEL_CAP ? TPHT_NOT_FOUND : TPHT_OK));
             if (st == TPHT_OK) model[idx].value = val;
         } else if (action == 3) {
-            tpht_status_t st = tpht_remove(t, key);
+            tpht_status_t st = t.remove(t.handle, key);
             assert(st == (idx == MODEL_CAP ? TPHT_NOT_FOUND : TPHT_OK));
             if (st == TPHT_OK) model[idx].live = 0;
         } else {
-            tpht_status_t st = tpht_get(t, key, &out);
+            tpht_status_t st = t.get(t.handle, key, &out);
             assert(st == (idx == MODEL_CAP ? TPHT_NOT_FOUND : TPHT_OK));
             if (st == TPHT_OK) assert(out == model[idx].value);
         }
@@ -60,12 +58,12 @@ static void run_random_model_case(const tpht_test_case_t *tc) {
         for (i = 0; i < MODEL_CAP; ++i) {
             if (model[i].live) {
                 live++;
-                tpht_test_assert_get(t, tc, model[i].key, model[i].value);
+                tpht_test_assert_get(&t, tc, model[i].key, model[i].value);
             }
         }
-        assert(tpht_size(t) == live);
+        assert(t.size(t.handle) == live);
     }
-    tpht_destroy(t);
+    t.destroy(t.handle);
 }
 
 void tpht_test_run_random_model_module(void) {
