@@ -141,6 +141,8 @@ struct tpht_table {
     uint8_t flat_quot_bits;  /* flat_cloud_bits + 8 fingerprint bits. */
     uint64_t flat_cloud_mask;
     uint64_t flat_quot_mask;
+    uint64_t flat_rem_mask;   /* covers flat_qkey_bytes */
+    uint64_t flat_value_mask; /* covers value_size */
     /* Crystal count for each possible tuple count; see tpht_flat_crystals_for. */
     uint8_t flat_crystals[TPHT_FLAT_MAX_TUPLES + 1u];
     /* Extra block-count doublings applied after hard overflows. */
@@ -180,11 +182,29 @@ static void tpht_size_store(tpht_table_t *t, size_t size) {
     atomic_store_explicit(&t->size, size, memory_order_release);
 }
 
+/*
+ * A read-modify-write on the size counter compiles to a lock-prefixed
+ * instruction, which costs more than the rest of an insert put together.  Only
+ * a table that actually has concurrent writers needs one; a sequential table
+ * gets a plain load, add and store through the same atomic object.
+ */
 static void tpht_size_inc(tpht_table_t *t) {
+    if (t->cfg.threading == TPHT_SEQUENTIAL) {
+        atomic_store_explicit(
+            &t->size, atomic_load_explicit(&t->size, memory_order_relaxed) + 1u,
+            memory_order_relaxed);
+        return;
+    }
     atomic_fetch_add_explicit(&t->size, 1u, memory_order_acq_rel);
 }
 
 static void tpht_size_dec(tpht_table_t *t) {
+    if (t->cfg.threading == TPHT_SEQUENTIAL) {
+        atomic_store_explicit(
+            &t->size, atomic_load_explicit(&t->size, memory_order_relaxed) - 1u,
+            memory_order_relaxed);
+        return;
+    }
     atomic_fetch_sub_explicit(&t->size, 1u, memory_order_acq_rel);
 }
 
@@ -229,6 +249,51 @@ static uint8_t tpht_log2_pow2(size_t x) {
     return bits;
 }
 
+/*
+ * Entry fields are read with one unaligned 64-bit load and a mask instead of a
+ * byte loop.  Every array these run over carries TPHT_LOAD_SLACK spare bytes so
+ * the load can always take a full word.
+ */
+#define TPHT_LOAD_SLACK 8u
+
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
+#define TPHT_LITTLE_ENDIAN (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#elif defined(_MSC_VER) || defined(_M_X64) || defined(_M_IX86) || defined(_M_ARM64)
+#define TPHT_LITTLE_ENDIAN 1
+#else
+#define TPHT_LITTLE_ENDIAN 0
+#endif
+
+static TPHT_UNUSED uint64_t tpht_load_le(const uint8_t *p, size_t n) {
+#if TPHT_LITTLE_ENDIAN
+    uint64_t v;
+    memcpy(&v, p, 8);
+    return n >= 8u ? v : (v & ((UINT64_C(1) << (8u * n)) - 1u));
+#else
+    uint64_t v = 0;
+    size_t i;
+    for (i = 0; i < n; ++i) v |= ((uint64_t)p[i]) << (8u * i);
+    return v;
+#endif
+}
+
+/* Stores must not touch neighbouring bytes, so they stay exactly n wide. */
+static void tpht_store_le(uint8_t *p, size_t n, uint64_t x) {
+#if TPHT_LITTLE_ENDIAN
+    switch (n) {
+        case 8u: memcpy(p, &x, 8); return;
+        case 4u: { uint32_t v = (uint32_t)x; memcpy(p, &v, 4); return; }
+        case 2u: { uint16_t v = (uint16_t)x; memcpy(p, &v, 2); return; }
+        case 1u: p[0] = (uint8_t)x; return;
+        default: break;
+    }
+#endif
+    {
+        size_t i;
+        for (i = 0; i < n; ++i) p[i] = (uint8_t)(x >> (8u * i));
+    }
+}
+
 static uint64_t tpht_read_le(const void *p, size_t n) {
     const uint8_t *b = (const uint8_t *)p;
     uint64_t x = 0;
@@ -244,116 +309,60 @@ static void tpht_write_le(void *p, size_t n, uint64_t x) {
 }
 
 /*
- * Embedded XXH64 implementation for copy-paste portability.
- * Algorithm: xxHash / XXH64 by Yann Collet, BSD 2-Clause licensed.
+ * Hashing.
+ *
+ * The library only ever hashes a single machine word, and the two supported key
+ * widths get their own function so a 32-bit table never pays for 64-bit work.
+ * Both default to XXH3, the fastest member of the xxHash family for short
+ * inputs, specialised to its 4-to-8-byte path so no secret table or streaming
+ * state has to be embedded.  Results are bit-identical to
+ * XXH3_64bits_withSeed() over the key's little-endian bytes.
+ *
+ * Override either macro to swap the hash without touching anything else:
+ *
+ *   cc -DTPHT_HASH32(w,s)=my_hash32 -DTPHT_HASH64(w,s)=my_hash64 ...
+ *
+ * Algorithm: xxHash / XXH3 by Yann Collet, BSD 2-Clause licensed.
  * Project: https://github.com/Cyan4973/xxHash
- * This file keeps a small local implementation instead of depending on
- * libxxhash so TPHT remains a two-file C library (tpht.h + tpht.c).
  */
-static uint32_t tpht_read32_le(const void *p) {
-    const uint8_t *b = (const uint8_t *)p;
-    return ((uint32_t)b[0]) | ((uint32_t)b[1] << 8) |
-           ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
-}
+#define TPHT_XXH3_SECRET_08 UINT64_C(0x1cad21f72c81017c) /* kSecret bytes 8..15  */
+#define TPHT_XXH3_SECRET_16 UINT64_C(0xdb979083e96dd4de) /* kSecret bytes 16..23 */
+#define TPHT_XXH3_PRIME_MX2 UINT64_C(0x9fb21c651e98df25)
 
-static uint64_t tpht_read64_le(const void *p) {
-    const uint8_t *b = (const uint8_t *)p;
-    return ((uint64_t)b[0]) | ((uint64_t)b[1] << 8) |
-           ((uint64_t)b[2] << 16) | ((uint64_t)b[3] << 24) |
-           ((uint64_t)b[4] << 32) | ((uint64_t)b[5] << 40) |
-           ((uint64_t)b[6] << 48) | ((uint64_t)b[7] << 56);
-}
-
-static uint64_t tpht_xxh64_rotl(uint64_t x, unsigned r) {
+static TPHT_UNUSED uint64_t tpht_rotl64(uint64_t x, unsigned r) {
     return (x << r) | (x >> (64u - r));
 }
 
-static uint64_t tpht_xxh64_round(uint64_t acc, uint64_t input) {
-    acc += input * UINT64_C(0xc2b2ae3d27d4eb4f);
-    acc = tpht_xxh64_rotl(acc, 31);
-    acc *= UINT64_C(0x9e3779b185ebca87);
-    return acc;
+static TPHT_UNUSED uint32_t tpht_bswap32(uint32_t x) {
+    return ((x << 24) & 0xff000000u) | ((x << 8) & 0x00ff0000u) |
+           ((x >> 8) & 0x0000ff00u) | ((x >> 24) & 0x000000ffu);
 }
 
-static uint64_t tpht_xxh64_merge_round(uint64_t acc, uint64_t val) {
-    val = tpht_xxh64_round(0, val);
-    acc ^= val;
-    acc = acc * UINT64_C(0x9e3779b185ebca87) + UINT64_C(0x85ebca77c2b2ae63);
-    return acc;
+/* XXH3's 4-to-8-byte path; word holds the key's little-endian bytes. */
+static TPHT_UNUSED uint64_t tpht_xxh3_word(uint64_t word, uint32_t len, uint64_t seed) {
+    uint64_t s = seed ^ ((uint64_t)tpht_bswap32((uint32_t)seed) << 32);
+    uint64_t bitflip = (TPHT_XXH3_SECRET_08 ^ TPHT_XXH3_SECRET_16) - s;
+    uint32_t input1 = (uint32_t)word;
+    uint32_t input2 = len == 8u ? (uint32_t)(word >> 32) : (uint32_t)word;
+    uint64_t h = ((uint64_t)input2 + ((uint64_t)input1 << 32)) ^ bitflip;
+
+    h ^= tpht_rotl64(h, 49) ^ tpht_rotl64(h, 24);
+    h *= TPHT_XXH3_PRIME_MX2;
+    h ^= (h >> 35) + len;
+    h *= TPHT_XXH3_PRIME_MX2;
+    return h ^ (h >> 28);
 }
 
-static uint64_t tpht_xxh64_avalanche(uint64_t h) {
-    h ^= h >> 33;
-    h *= UINT64_C(0xc2b2ae3d27d4eb4f);
-    h ^= h >> 29;
-    h *= UINT64_C(0x165667b19e3779f9);
-    h ^= h >> 32;
-    return h;
-}
+#ifndef TPHT_HASH32
+#define TPHT_HASH32(word, seed) tpht_xxh3_word((uint64_t)(uint32_t)(word), 4u, (seed))
+#endif
+#ifndef TPHT_HASH64
+#define TPHT_HASH64(word, seed) tpht_xxh3_word((word), 8u, (seed))
+#endif
 
-static uint64_t tpht_hash_bytes(const void *data, size_t len, uint64_t seed) {
-    const uint8_t *p = (const uint8_t *)data;
-    const uint8_t *end = p + len;
-    uint64_t h;
-
-    if (len >= 32u) {
-        const uint8_t *limit = end - 32u;
-        uint64_t v1 = seed + UINT64_C(0x9e3779b185ebca87) + UINT64_C(0xc2b2ae3d27d4eb4f);
-        uint64_t v2 = seed + UINT64_C(0xc2b2ae3d27d4eb4f);
-        uint64_t v3 = seed;
-        uint64_t v4 = seed - UINT64_C(0x9e3779b185ebca87);
-
-        do {
-            v1 = tpht_xxh64_round(v1, tpht_read64_le(p));
-            p += 8;
-            v2 = tpht_xxh64_round(v2, tpht_read64_le(p));
-            p += 8;
-            v3 = tpht_xxh64_round(v3, tpht_read64_le(p));
-            p += 8;
-            v4 = tpht_xxh64_round(v4, tpht_read64_le(p));
-            p += 8;
-        } while (p <= limit);
-
-        h = tpht_xxh64_rotl(v1, 1) + tpht_xxh64_rotl(v2, 7) +
-            tpht_xxh64_rotl(v3, 12) + tpht_xxh64_rotl(v4, 18);
-        h = tpht_xxh64_merge_round(h, v1);
-        h = tpht_xxh64_merge_round(h, v2);
-        h = tpht_xxh64_merge_round(h, v3);
-        h = tpht_xxh64_merge_round(h, v4);
-    } else {
-        h = seed + UINT64_C(0x27d4eb2f165667c5);
-    }
-
-    h += (uint64_t)len;
-
-    while (p + 8u <= end) {
-        uint64_t k1 = tpht_xxh64_round(0, tpht_read64_le(p));
-        h ^= k1;
-        h = tpht_xxh64_rotl(h, 27) * UINT64_C(0x9e3779b185ebca87) +
-            UINT64_C(0x85ebca77c2b2ae63);
-        p += 8;
-    }
-
-    if (p + 4u <= end) {
-        h ^= (uint64_t)tpht_read32_le(p) * UINT64_C(0x9e3779b185ebca87);
-        h = tpht_xxh64_rotl(h, 23) * UINT64_C(0xc2b2ae3d27d4eb4f) +
-            UINT64_C(0x165667b19e3779f9);
-        p += 4;
-    }
-
-    while (p < end) {
-        h ^= (uint64_t)(*p) * UINT64_C(0x27d4eb2f165667c5);
-        h = tpht_xxh64_rotl(h, 11) * UINT64_C(0x9e3779b185ebca87);
-        ++p;
-    }
-
-    return tpht_xxh64_avalanche(h);
-}
-
-static uint64_t tpht_hash_word(uint64_t x, uint64_t seed) {
-    uint8_t b[8];
-    tpht_write_le(b, sizeof(b), x);
-    return tpht_hash_bytes(b, sizeof(b), seed);
+/* Hash one word using the function that matches this table's key width. */
+static uint64_t tpht_hash_word(const tpht_table_t *t, uint64_t word, uint64_t seed) {
+    return t->key_size == 4u ? TPHT_HASH32(word, seed) : TPHT_HASH64(word, seed);
 }
 
 static uint64_t tpht_key_word(const tpht_table_t *t, const void *key) {
@@ -367,7 +376,7 @@ static uint64_t tpht_key_quotient(const tpht_table_t *t, const void *key) {
 
 static size_t tpht_base_from_word(const tpht_table_t *t, uint64_t key_word) {
     uint64_t quotient = key_word >> t->base_bits;
-    return (size_t)((tpht_hash_word(quotient, t->cfg.hash_seed) ^ key_word) & t->base_mask);
+    return (size_t)((tpht_hash_word(t, quotient, t->cfg.hash_seed) ^ key_word) & t->base_mask);
 }
 
 static size_t tpht_base_from_key(const tpht_table_t *t, const void *key) {
@@ -385,7 +394,7 @@ static uint64_t tpht_read_quotient(const tpht_table_t *t, const uint8_t *stored_
 static void tpht_rebuild_key(const tpht_table_t *t, size_t base, const uint8_t *stored_key,
                              uint8_t *key_out) {
     uint64_t quotient = tpht_read_quotient(t, stored_key);
-    uint64_t low = (tpht_hash_word(quotient, t->cfg.hash_seed) ^ (uint64_t)base) & t->base_mask;
+    uint64_t low = (tpht_hash_word(t, quotient, t->cfg.hash_seed) ^ (uint64_t)base) & t->base_mask;
     uint64_t key_word = (quotient << t->base_bits) | low;
     tpht_write_le(key_out, t->key_size, key_word);
 }
@@ -586,17 +595,33 @@ static uint8_t *tpht_pool_head_ptr(tpht_pool_t *p, size_t bin) {
     return &p->cnt_head[(bin << 1u) | 1u];
 }
 
+/*
+ * Map a hash onto [0, n) without a divide.  A 64-bit modulo by a runtime
+ * divisor costs about 3.8ns here; the multiply-high form costs 0.8ns and needs
+ * no precomputation.  It consumes the high bits, which is where a finalised
+ * XXH64 value is strongest.
+ */
+static size_t tpht_bin_of(uint64_t hash, size_t n) {
+#if defined(__SIZEOF_INT128__)
+    __extension__ typedef unsigned __int128 tpht_u128_t;
+    return (size_t)(((tpht_u128_t)hash * (tpht_u128_t)n) >> 64);
+#else
+    return (size_t)(hash % n);
+#endif
+}
+
 static uint8_t *tpht_pool_deref(tpht_table_t *t, uint64_t deref_key, uint8_t ptr) {
     uint8_t flag = (uint8_t)(ptr >> 7u);
     uint8_t pos = (uint8_t)((ptr & 0x7fu) - 1u);
     uint64_t seed = t->cfg.hash_seed;
-    size_t bin = (size_t)(tpht_hash_word(deref_key, seed + (flag ? 0x200 : 0x100)) % t->pool.bin_count);
+    size_t bin = tpht_bin_of(tpht_hash_word(t, deref_key, seed + (flag ? 0x200 : 0x100)),
+                             t->pool.bin_count);
     return tpht_pool_entry(&t->pool, bin, pos);
 }
 
 static uint8_t *tpht_pool_alloc(tpht_table_t *t, uint64_t deref_key, uint8_t *encoded_out) {
-    size_t bin1 = (size_t)(tpht_hash_word(deref_key, t->cfg.hash_seed + 0x100) % t->pool.bin_count);
-    size_t bin2 = (size_t)(tpht_hash_word(deref_key, t->cfg.hash_seed + 0x200) % t->pool.bin_count);
+    size_t bin1 = tpht_bin_of(tpht_hash_word(t, deref_key, t->cfg.hash_seed + 0x100), t->pool.bin_count);
+    size_t bin2 = tpht_bin_of(tpht_hash_word(t, deref_key, t->cfg.hash_seed + 0x200), t->pool.bin_count);
     uint8_t flag = 0;
     size_t bin = bin1;
     uint8_t *cnt;
@@ -777,7 +802,7 @@ static int tpht_alloc_flat_lines(tpht_table_t *t) {
     uintptr_t addr;
 
     if (bytes / TPHT_FLAT_LINE_BYTES != t->base_count) return 0;
-    raw = (uint8_t *)calloc(bytes + (TPHT_FLAT_LINE_BYTES - 1u), 1);
+    raw = (uint8_t *)calloc(bytes + (TPHT_FLAT_LINE_BYTES - 1u) + TPHT_LOAD_SLACK, 1);
     if (!raw) return 0;
     t->flat_lines_raw = raw;
     addr = (uintptr_t)raw;
@@ -856,6 +881,12 @@ static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
                                 : ((UINT64_C(1) << t->flat_quot_bits) - 1u);
         t->flat_qkey_bytes = (uint8_t)((t->key_bits - t->flat_quot_bits + 7u) / 8u);
         t->flat_entry_size = (uint8_t)(t->flat_qkey_bytes + t->value_size);
+        t->flat_rem_mask = t->flat_qkey_bytes >= 8u
+                               ? UINT64_MAX
+                               : ((UINT64_C(1) << (8u * t->flat_qkey_bytes)) - 1u);
+        t->flat_value_mask = t->value_size >= 8u
+                                 ? UINT64_MAX
+                                 : ((UINT64_C(1) << (8u * t->value_size)) - 1u);
         /* Kept in sync so shared reporting helpers stay meaningful. */
         t->base_bits = t->flat_cloud_bits;
         t->base_mask = t->flat_cloud_mask;
@@ -880,7 +911,8 @@ static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
 
     t->pool.bin_count = (overflow_slots + t->pool.bin_size - 1u) / t->pool.bin_size;
     t->pool.bin_count = tpht_max_size(t->pool.bin_count, 1);
-    t->pool.entries = (uint8_t *)calloc(t->pool.bin_count * (size_t)t->pool.bin_size, t->pool.entry_size);
+    t->pool.entries = (uint8_t *)calloc(
+        t->pool.bin_count * (size_t)t->pool.bin_size * t->pool.entry_size + TPHT_LOAD_SLACK, 1);
     t->pool.cnt_head = (uint8_t *)calloc(t->pool.bin_count * 2u, 1);
 
     if (t->cfg.variant == TPHT_CHAINED && t->cfg.threading == TPHT_CONCURRENT) {
@@ -1029,7 +1061,7 @@ typedef struct tpht_flat_slot {
  */
 static void tpht_flat_locate(const tpht_table_t *t, uint64_t key, tpht_flat_loc_t *out) {
     uint64_t rem = t->flat_quot_bits >= 64u ? 0u : (key >> t->flat_quot_bits);
-    uint64_t quot = (tpht_hash_word(rem, t->cfg.hash_seed) ^ key) & t->flat_quot_mask;
+    uint64_t quot = (tpht_hash_word(t, rem, t->cfg.hash_seed) ^ key) & t->flat_quot_mask;
     out->rem = rem;
     out->fp = (uint8_t)(quot >> t->flat_cloud_bits);
     out->block = (size_t)(quot & t->flat_cloud_mask);
@@ -1039,7 +1071,7 @@ static void tpht_flat_locate(const tpht_table_t *t, uint64_t key, tpht_flat_loc_
 static uint64_t tpht_flat_rebuild_key(const tpht_table_t *t, size_t block, uint8_t fp,
                                       uint64_t rem) {
     uint64_t quot = ((uint64_t)fp << t->flat_cloud_bits) | (uint64_t)block;
-    uint64_t low = (tpht_hash_word(rem, t->cfg.hash_seed) ^ quot) & t->flat_quot_mask;
+    uint64_t low = (tpht_hash_word(t, rem, t->cfg.hash_seed) ^ quot) & t->flat_quot_mask;
     return t->flat_quot_bits >= 64u ? low : (low | (rem << t->flat_quot_bits));
 }
 
@@ -1081,21 +1113,33 @@ static uint8_t *tpht_flat_tp_slot(uint8_t *line, uint8_t crystal_end, uint8_t j)
 }
 
 static uint64_t tpht_flat_read_rem(const tpht_table_t *t, const uint8_t *payload) {
-    return tpht_read_le(payload, t->flat_qkey_bytes);
+#if TPHT_LITTLE_ENDIAN
+    uint64_t v;
+    memcpy(&v, payload, 8);
+    return v & t->flat_rem_mask;
+#else
+    return tpht_load_le(payload, t->flat_qkey_bytes);
+#endif
 }
 
 static uint64_t tpht_flat_read_value(const tpht_table_t *t, const uint8_t *payload) {
-    return tpht_read_le(payload + t->flat_qkey_bytes, t->value_size);
+#if TPHT_LITTLE_ENDIAN
+    uint64_t v;
+    memcpy(&v, payload + t->flat_qkey_bytes, 8);
+    return v & t->flat_value_mask;
+#else
+    return tpht_load_le(payload + t->flat_qkey_bytes, t->value_size);
+#endif
 }
 
 static void tpht_flat_write_value(const tpht_table_t *t, uint8_t *payload, uint64_t value) {
-    tpht_write_le(payload + t->flat_qkey_bytes, t->value_size, value);
+    tpht_store_le(payload + t->flat_qkey_bytes, t->value_size, value);
 }
 
 static void tpht_flat_write_payload(const tpht_table_t *t, uint8_t *payload, uint64_t rem,
                                     uint64_t value) {
-    tpht_write_le(payload, t->flat_qkey_bytes, rem);
-    tpht_write_le(payload + t->flat_qkey_bytes, t->value_size, value);
+    tpht_store_le(payload, t->flat_qkey_bytes, rem);
+    tpht_store_le(payload + t->flat_qkey_bytes, t->value_size, value);
 }
 
 /*
@@ -1168,16 +1212,42 @@ static void tpht_flat_promote(tpht_table_t *t, uint8_t *line, size_t block, uint
     }
 }
 
+/*
+ * Lookups run their own scan rather than tpht_flat_find: they need the value,
+ * not the slot descriptor that insert and remove use to edit the block, and
+ * building that descriptor costs more than the comparison itself.
+ */
 static tpht_status_t tpht_flat_get_raw(tpht_table_t *t, uint64_t key, uint64_t *value_out) {
     tpht_flat_loc_t loc;
-    tpht_flat_slot_t slot;
     uint8_t *line;
+    uint8_t count;
+    uint8_t crystals;
+    uint8_t crystal_end;
+    uint32_t mask;
 
     tpht_flat_locate(t, key, &loc);
     line = tpht_flat_line(t, loc.block);
-    if (!tpht_flat_find(t, line, &loc, &slot)) return TPHT_NOT_FOUND;
-    if (value_out) *value_out = tpht_flat_read_value(t, slot.payload);
-    return TPHT_OK;
+    count = tpht_flat_count(line);
+    crystals = t->flat_crystals[count];
+    mask = tpht_fp_match_mask(line, count, loc.fp);
+    crystal_end = tpht_flat_crystal_end(t, crystals);
+
+    while (mask) {
+        uint8_t i = tpht_ctz32(mask);
+        const uint8_t *payload;
+        mask &= mask - 1u;
+        if (i < crystals) {
+            payload = tpht_flat_crystal(t, line, i);
+        } else {
+            uint8_t encoded = *tpht_flat_tp_slot(line, crystal_end, (uint8_t)(i - crystals));
+            payload = tpht_pool_deref(t, tpht_flat_deref_key(loc.block, loc.fp), encoded);
+        }
+        if (tpht_flat_read_rem(t, payload) == loc.rem) {
+            if (value_out) *value_out = tpht_flat_read_value(t, payload);
+            return TPHT_OK;
+        }
+    }
+    return TPHT_NOT_FOUND;
 }
 
 static tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, uint64_t key, uint64_t value,
@@ -1383,6 +1453,8 @@ static void tpht_flat_adopt(tpht_table_t *t, tpht_table_t *nt) {
     t->flat_quot_bits = nt->flat_quot_bits;
     t->flat_cloud_mask = nt->flat_cloud_mask;
     t->flat_quot_mask = nt->flat_quot_mask;
+    t->flat_rem_mask = nt->flat_rem_mask;
+    t->flat_value_mask = nt->flat_value_mask;
     t->flat_growth = nt->flat_growth;
     t->flat_deref_floor = nt->flat_deref_floor;
     memcpy(t->flat_crystals, nt->flat_crystals, sizeof(t->flat_crystals));

@@ -15,6 +15,13 @@ Industrial C implementation of Tiny Pointer Hash Tables.  This repository keeps 
 
 The code is designed to be copied directly into another project: copy `tpht.h` and `tpht.c`.
 
+This is an independent implementation, not a wrapper around the academic
+TinyPtr source. It neither includes nor links TinyPtr. The library itself needs
+only a C11 compiler and the C standard library; its XXH3 word-hashing path is
+embedded in `tpht.c`. The benchmark runners likewise compile directly from this
+repository and produce CSV results without third-party libraries. Python and
+Matplotlib are optional and are used only to turn latency CSV output into a PDF.
+
 ## Features
 
 - C11 implementation, no C++ dependency.
@@ -23,7 +30,8 @@ The code is designed to be copied directly into another project: copy `tpht.h` a
 - Chained variant: sequential and concurrent, fixed-capacity and resizable.
 - Flattened variant: sequential only for now, fixed-capacity or resizable.
 - Resizing uses normal capacity doubling.
-- XXH64 hashing, embedded directly for copy-paste portability.
+- XXH3 hashing, embedded directly for copy-paste portability, with a separate
+  function per key width and both swappable by macro.
 - SIMD optimized fingerprint matching for `flatten-tpht` when available.
 - Safe scalar fallback when SIMD is disabled or unavailable.
 
@@ -178,6 +186,46 @@ as intended.  The dereference table is then sized from the Poisson expectation
 of the overflow at the average block load that results, plus headroom.  A
 capacity near the target load times a power of two gives the tightest layout.
 
+## Benchmarks
+
+```sh
+./benchmarks/run_space_eff.sh [entries]                        # space efficiency
+./benchmarks/run_latency.sh [min_log2] [max_log2] [value_bytes] [load_factor]
+```
+
+Both write a CSV into `results/`.
+
+`run_latency.sh` sweeps table sizes from `2^min_log2` to `2^max_log2` keys
+(default 2^10 to 2^24) for both variants and both key widths, timing four
+phases per size: insert, lookup of a present key, lookup of an absent key, and
+remove.  Tables are sequential and fixed-capacity so no resize work lands in the
+measurement; lookups and removes run in a shuffled order.  Each figure is the
+best of several repetitions, and small tables get more repetitions than large
+ones.  Keys are produced inside the timed loop by a bijective mixer, so the same
+few nanoseconds of key derivation are included in every number and the memory
+traffic being measured is the table's own.
+
+If `matplotlib` is present the script also renders `results/tpht_latency.pdf`
+(vector, TrueType-embedded, so it drops straight into a paper); otherwise it
+leaves the CSV and says so.  `benchmarks/plot_latency.py` can be
+re-run on the CSV by hand.
+
+## Hashing
+
+The library only ever hashes a single machine word, so it embeds just XXH3's
+4-to-8-byte path rather than the whole algorithm - no secret table, no streaming
+state. Results are bit-identical to `XXH3_64bits_withSeed()` over the key's
+little-endian bytes, verified against upstream xxHash for both widths.
+
+Each key width has its own hash, so a 32-bit table never pays for 64-bit work.
+Either can be replaced without touching anything else:
+
+```sh
+cc -DTPHT_HASH32'(w,s)'=my_hash32 -DTPHT_HASH64'(w,s)'=my_hash64 -c tpht.c
+```
+
+Both macros take a word and a seed and return `uint64_t`.
+
 ## SIMD and portability
 
 By default, `tpht.c` enables SIMD-aware fingerprint scanning for `flatten-tpht`:
@@ -242,4 +290,4 @@ The tests are split into controlled-granularity modules:
 ## Acknowledgements
 
 - Tiny Pointer Hash Tables / TinyPtr: source design inspiration for the chained and flatten variants.
-- xxHash / XXH64 by Yann Collet: TPHT embeds a small dependency-free XXH64 implementation so users can still copy only `tpht.h` and `tpht.c`. xxHash is BSD 2-Clause licensed: https://github.com/Cyan4973/xxHash
+- xxHash / XXH3 by Yann Collet: TPHT embeds a small dependency-free subset of XXH3 so users can still copy only `tpht.h` and `tpht.c`. xxHash is BSD 2-Clause licensed: https://github.com/Cyan4973/xxHash

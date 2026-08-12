@@ -22,5 +22,8 @@ target_link_libraries(tpht_test PRIVATE tpht)
 add_executable(tpht_space_eff benchmarks/tpht_space_eff.c)
 target_link_libraries(tpht_space_eff PRIVATE tpht)
 
+add_executable(tpht_latency benchmarks/tpht_latency.c)
+target_link_libraries(tpht_latency PRIVATE tpht)
+
 enable_testing()
 add_test(NAME tpht_test COMMAND tpht_test)
