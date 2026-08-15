@@ -1256,6 +1256,7 @@ static tpht_status_t tpht_flat_get_raw(tpht_table_t *t, uint64_t key, uint64_t *
     uint8_t crystals;
     uint8_t crystal_end;
     uint32_t mask;
+    uint32_t tp_mask;
 
     tpht_flat_locate(t, key, &loc, key_bytes);
     line = tpht_flat_line(t, loc.block);
@@ -1264,16 +1265,32 @@ static tpht_status_t tpht_flat_get_raw(tpht_table_t *t, uint64_t key, uint64_t *
     mask = tpht_fp_match_mask(line, count, loc.fp);
     crystal_end = tpht_flat_crystal_end(t, crystals);
 
+    /*
+     * Split the match mask once instead of asking "is this one inline?" per
+     * candidate.  Fingerprints are ordered crystals first, so the low
+     * `crystals` bits are the inline matches and the rest are overflow ones.
+     * That keeps the common loop free of a data-dependent branch and keeps the
+     * dereference out of it entirely.
+     */
+    tp_mask = mask >> crystals;
+    mask &= (UINT32_C(1) << crystals) - 1u;
+
     while (mask) {
         uint8_t i = tpht_ctz32(mask);
-        const uint8_t *payload;
+        const uint8_t *payload = tpht_flat_crystal(t, line, i);
         mask &= mask - 1u;
-        if (i < crystals) {
-            payload = tpht_flat_crystal(t, line, i);
-        } else {
-            uint8_t encoded = *tpht_flat_tp_slot(line, crystal_end, (uint8_t)(i - crystals));
-            payload = tpht_pool_deref(t, tpht_flat_deref_key(loc.block, loc.fp), encoded, key_bytes);
+        if (tpht_flat_read_rem(t, payload) == loc.rem) {
+            if (value_out) *value_out = tpht_flat_read_value(t, payload);
+            return TPHT_OK;
         }
+    }
+
+    while (tp_mask) {
+        uint8_t j = tpht_ctz32(tp_mask);
+        uint8_t encoded = *tpht_flat_tp_slot(line, crystal_end, j);
+        const uint8_t *payload =
+            tpht_pool_deref(t, tpht_flat_deref_key(loc.block, loc.fp), encoded, key_bytes);
+        tp_mask &= tp_mask - 1u;
         if (tpht_flat_read_rem(t, payload) == loc.rem) {
             if (value_out) *value_out = tpht_flat_read_value(t, payload);
             return TPHT_OK;

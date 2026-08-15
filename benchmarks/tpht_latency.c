@@ -218,8 +218,13 @@ int main(int argc, char **argv) {
     for (vi = 0; vi < sizeof(runs) / sizeof(runs[0]); ++vi) {
         for (log2n = min_log2; log2n <= max_log2; ++log2n) {
             size_t n = (size_t)1u << log2n;
-            /* More repetitions for small tables, where noise dominates. */
-            unsigned reps = n < (1u << 16) ? 5u : (n < (1u << 21) ? 3u : 1u);
+            /*
+             * Large tables are the noisy ones, not the small ones: a single
+             * pass over a table that misses cache varies by tens of percent
+             * run to run, so every size gets several repetitions and the best
+             * is reported.
+             */
+            unsigned reps = n < (1u << 16) ? 5u : (n < (1u << 22) ? 4u : 3u);
             if (runs[vi](value_size, n, load_factor, reps, &sink) != 0) rc = 1;
         }
     }
