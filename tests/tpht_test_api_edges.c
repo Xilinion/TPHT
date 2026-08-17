@@ -14,10 +14,13 @@ static void run_api_edges_case(const tpht_test_case_t *tc) {
     assert(t.update(t.handle, 42u, 100u) == TPHT_NOT_FOUND);
     assert(t.remove(t.handle, 42u) == TPHT_NOT_FOUND);
     assert(t.insert(t.handle, 42u, 100u) == TPHT_OK);
-    assert(t.insert(t.handle, 42u, 100u) == TPHT_EXISTS);
+    /* insert appends unconditionally (no existence probe), so a repeat insert
+     * is an append, not an TPHT_EXISTS.  Overwrite is put/update's job. */
+    assert(t.insert(t.handle, 42u, 100u) == TPHT_OK);
     assert(t.update(t.handle, 42u, 200u) == TPHT_OK);
     tpht_test_assert_get(&t, tc, 42u, 200u);
     assert(t.remove(t.handle, 42u) == TPHT_OK);
+    assert(t.remove(t.handle, 42u) == TPHT_OK); /* drop the appended duplicate */
     tpht_test_assert_missing(&t, 42u);
 
     if (tc->resize_mode == TPHT_FIXED) {
@@ -28,7 +31,9 @@ static void run_api_edges_case(const tpht_test_case_t *tc) {
         /* An overwrite of a key already present still succeeds at capacity. */
         assert(t.put(t.handle, 1000u, 77u) == TPHT_OK);
         tpht_test_assert_get(&t, tc, 1000u, 77u);
-        assert(t.insert(t.handle, 1000u, 5u) == TPHT_EXISTS);
+        /* Append-only insert cannot acknowledge the existing key; the block is
+         * full so the append attempt reports TPHT_FULL. */
+        assert(t.insert(t.handle, 1000u, 5u) == TPHT_FULL);
     }
     (void)out;
     t.destroy(t.handle);

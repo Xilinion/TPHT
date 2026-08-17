@@ -138,7 +138,7 @@ static void test_flat_block_churn(tpht_test_kind_t kind, uint8_t value_size) {
                 if (live[i]) { assert(t.remove(t.handle, keys[i]) == TPHT_OK); live[i] = 0; }
             } else if (!live[i]) {
                 tpht_status_t st = t.insert(t.handle, keys[i], keys[i] ^ 0x5a5au);
-                assert(st == TPHT_OK || st == TPHT_EXISTS);
+                assert(st == TPHT_OK);
                 live[i] = 1;
             }
         }

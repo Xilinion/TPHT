@@ -22,8 +22,7 @@ static void run_deterministic_case(const tpht_test_case_t *tc) {
     }
 
     for (i = 0; i < n; i += 5u) {
-        assert(t.insert(t.handle, i, i * 19u + 5u) == TPHT_EXISTS);
-        assert(t.update(t.handle, i, i * 19u + 5u) == TPHT_OK);
+        assert(t.put(t.handle, i, i * 19u + 5u) == TPHT_OK); /* upsert overwrites */
     }
     for (i = 0; i < n; i += 5u) tpht_test_assert_get(&t, tc, i, i * 19u + 5u);
 

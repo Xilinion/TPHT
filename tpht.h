@@ -43,6 +43,18 @@ typedef enum tpht_status {
     TPHT_INVALID = 5
 } tpht_status_t;
 
+/*
+ * The three write operations:
+ *
+ *   insert  append-only: it never probes for an existing key, so inserting a
+ *           key that is already present appends a duplicate (matching TinyPtr's
+ *           Insert).  Fastest write; callers that need uniqueness use put/update.
+ *   put     upsert: overwrite the value if the key exists, else append it.
+ *   update  overwrite-only: return TPHT_NOT_FOUND if the key is absent.
+ *
+ * TPHT_EXISTS is retained for API compatibility but insert no longer returns it.
+ */
+
 typedef enum tpht_resize_mode {
     TPHT_FIXED = 0,
     TPHT_RESIZABLE = 1

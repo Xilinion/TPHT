@@ -73,9 +73,12 @@ typedef struct tpht_table tpht_table_t;
  * branch survives.  Forcing the inline makes each entry point fold it away.
  */
 #define TPHT_HOT static inline __attribute__((always_inline))
+/* Cold-path bodies whose stack frames must stay off the hot path. */
+#define TPHT_NOINLINE __attribute__((noinline))
 #else
 #define TPHT_UNUSED
 #define TPHT_HOT static inline
+#define TPHT_NOINLINE
 #endif
 
 #define TPHT_DEFAULT_BIN_SIZE 127u
@@ -153,7 +156,15 @@ struct tpht_table {
     size_t key_size;   /* 4 or 8. */
     size_t value_size; /* 1 to 8. */
     uint64_t key_mask;
+    /* XXH3 "bitflip" value for the main seed, precomputed so the lookup hash
+     * does not re-derive it (seed ^ bswap32(seed) << 32) on every call. */
+    uint64_t hash_bitflip;
+    /* Bitflips for the two chained dereference seeds (seed + 0x100 / 0x200),
+     * precomputed so the per-step chain walk does not re-derive them either. */
+    uint64_t hash_bitflip_100;
+    uint64_t hash_bitflip_200;
     size_t key_quotient_size;
+    uint64_t quotient_mask; /* low (key_quotient_size*8) bits set. */
     size_t inline_entry_size; /* stored key + value. */
     size_t pool_entry_size;   /* dereference table entry. */
     uint8_t key_bits;
@@ -176,11 +187,7 @@ struct tpht_table {
     uint64_t flat_value_mask; /* covers value_size */
     /* Crystal count for each possible tuple count; see tpht_flat_crystals_for. */
     uint8_t flat_crystals[TPHT_FLAT_MAX_TUPLES + 1u];
-    /*
-     * Byte offset of each crystal inside a block.  One table lookup replaces
-     * the multiply that both the crystal address and the tiny-pointer anchor
-     * would otherwise need, and removes their dependency on flat_entry_size.
-     */
+    /* Byte offset of each crystal inside a block, indexed by crystal index. */
     uint8_t flat_crystal_off[TPHT_FLAT_MAX_TUPLES + 1u];
     /* Extra block-count doublings applied after hard overflows. */
     uint8_t flat_growth;
@@ -333,19 +340,11 @@ static void tpht_store_le(uint8_t *p, size_t n, uint64_t x) {
 }
 
 static uint64_t tpht_read_le(const void *p, size_t n) {
-    const uint8_t *b = (const uint8_t *)p;
-    uint64_t x = 0;
-    size_t i;
-    if (n > 8u) n = 8u;
-    for (i = 0; i < n; ++i) x |= ((uint64_t)b[i]) << (8u * i);
-    return x;
+    return tpht_load_le((const uint8_t *)p, n);
 }
 
 static void tpht_write_le(void *p, size_t n, uint64_t x) {
-    uint8_t *b = (uint8_t *)p;
-    size_t i;
-    if (n > 8u) n = 8u; /* a word is never wider than this; lets the bound be seen */
-    for (i = 0; i < n; ++i) b[i] = (uint8_t)(x >> (8u * i));
+    tpht_store_le((uint8_t *)p, n, x);
 }
 
 /*
@@ -393,6 +392,23 @@ static TPHT_UNUSED uint64_t tpht_xxh3_word(uint64_t word, uint32_t len, uint64_t
     return h ^ (h >> 28);
 }
 
+/*
+ * Same 4-to-8-byte path, but the caller supplies the bitflip value directly.
+ * bitflip depends only on the seed, so it is computed once at table creation
+ * (see hash_bitflip) and stored; the per-call seed shuffling disappears.
+ */
+TPHT_HOT uint64_t tpht_xxh3_word_bitflip(uint64_t word, uint32_t len, uint64_t bitflip) {
+    uint32_t input1 = (uint32_t)word;
+    uint32_t input2 = len == 8u ? (uint32_t)(word >> 32) : (uint32_t)word;
+    uint64_t h = ((uint64_t)input2 + ((uint64_t)input1 << 32)) ^ bitflip;
+
+    h ^= tpht_rotl64(h, 49) ^ tpht_rotl64(h, 24);
+    h *= TPHT_XXH3_PRIME_MX2;
+    h ^= (h >> 35) + len;
+    h *= TPHT_XXH3_PRIME_MX2;
+    return h ^ (h >> 28);
+}
+
 #ifndef TPHT_HASH32
 #define TPHT_HASH32(word, seed) tpht_xxh3_word((uint64_t)(uint32_t)(word), 4u, (seed))
 #endif
@@ -419,7 +435,7 @@ static uint64_t tpht_key_quotient(const tpht_table_t *t, const void *key) {
 
 static size_t tpht_base_from_word(const tpht_table_t *t, uint64_t key_word) {
     uint64_t quotient = key_word >> t->base_bits;
-    return (size_t)((tpht_hash_w(quotient, t->cfg.hash_seed, t->key_size) ^ key_word) & t->base_mask);
+    return (size_t)((tpht_xxh3_word_bitflip(quotient, t->key_size, t->hash_bitflip) ^ key_word) & t->base_mask);
 }
 
 static size_t tpht_base_from_key(const tpht_table_t *t, const void *key) {
@@ -431,13 +447,19 @@ static void tpht_write_quotient(const tpht_table_t *t, uint8_t *dst, const void 
 }
 
 static uint64_t tpht_read_quotient(const tpht_table_t *t, const uint8_t *stored_key) {
+#if TPHT_LITTLE_ENDIAN
+    uint64_t v;
+    memcpy(&v, stored_key, 8);
+    return v & t->quotient_mask;
+#else
     return tpht_read_le(stored_key, t->key_quotient_size);
+#endif
 }
 
 static void tpht_rebuild_key(const tpht_table_t *t, size_t base, const uint8_t *stored_key,
                              uint8_t *key_out) {
     uint64_t quotient = tpht_read_quotient(t, stored_key);
-    uint64_t low = (tpht_hash_w(quotient, t->cfg.hash_seed, t->key_size) ^ (uint64_t)base) & t->base_mask;
+    uint64_t low = (tpht_xxh3_word_bitflip(quotient, t->key_size, t->hash_bitflip) ^ (uint64_t)base) & t->base_mask;
     uint64_t key_word = (quotient << t->base_bits) | low;
     tpht_write_le(key_out, t->key_size, key_word);
 }
@@ -446,7 +468,7 @@ static TPHT_UNUSED uint32_t tpht_low_mask(uint8_t count) {
     return count >= 32u ? UINT32_MAX : ((UINT32_C(1) << count) - 1u);
 }
 
-static TPHT_UNUSED uint32_t tpht_fp_match_mask_scalar(const uint8_t *fps, uint8_t count, uint8_t fp) {
+TPHT_HOT uint32_t tpht_fp_match_mask_scalar(const uint8_t *fps, uint8_t count, uint8_t fp) {
     uint32_t mask = 0;
     uint8_t i;
     for (i = 0; i < count; ++i) {
@@ -456,8 +478,12 @@ static TPHT_UNUSED uint32_t tpht_fp_match_mask_scalar(const uint8_t *fps, uint8_
 }
 
 #if defined(TPHT_X86_SIMD) && (defined(__GNUC__) || defined(__clang__))
+#if defined(__AVX2__)
+TPHT_HOT uint32_t tpht_fp_match_mask_avx2(const uint8_t *fps, uint8_t count, uint8_t fp) {
+#else
 __attribute__((target("avx2")))
 static TPHT_UNUSED uint32_t tpht_fp_match_mask_avx2(const uint8_t *fps, uint8_t count, uint8_t fp) {
+#endif
     __m256i needle = _mm256_set1_epi8((char)fp);
     __m256i hay = _mm256_loadu_si256((const __m256i *)(const void *)fps);
     __m256i eq = _mm256_cmpeq_epi8(hay, needle);
@@ -476,7 +502,7 @@ static TPHT_UNUSED int tpht_cpu_has_avx2(void) {
 #endif
 
 #if defined(TPHT_X86_SIMD) && (defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86_FP))
-static TPHT_UNUSED uint32_t tpht_fp_match_mask_sse2(const uint8_t *fps, uint8_t count, uint8_t fp) {
+TPHT_HOT uint32_t tpht_fp_match_mask_sse2(const uint8_t *fps, uint8_t count, uint8_t fp) {
     __m128i needle = _mm_set1_epi8((char)fp);
     __m128i hay0 = _mm_loadu_si128((const __m128i *)(const void *)fps);
     uint32_t mask = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(hay0, needle));
@@ -489,7 +515,7 @@ static TPHT_UNUSED uint32_t tpht_fp_match_mask_sse2(const uint8_t *fps, uint8_t 
 #endif
 
 #if defined(TPHT_NEON_SIMD)
-static TPHT_UNUSED uint32_t tpht_fp_match_mask_neon(const uint8_t *fps, uint8_t count, uint8_t fp) {
+TPHT_HOT uint32_t tpht_fp_match_mask_neon(const uint8_t *fps, uint8_t count, uint8_t fp) {
     uint8x16_t needle = vdupq_n_u8(fp);
     uint32_t mask = 0;
     uint8_t tmp[16];
@@ -508,7 +534,7 @@ static TPHT_UNUSED uint32_t tpht_fp_match_mask_neon(const uint8_t *fps, uint8_t 
 }
 #endif
 
-static uint32_t tpht_fp_match_mask(const uint8_t *fps, uint8_t count, uint8_t fp) {
+TPHT_HOT uint32_t tpht_fp_match_mask(const uint8_t *fps, uint8_t count, uint8_t fp) {
 #if TPHT_SIMD_MODE == TPHT_SIMD_SCALAR
     return tpht_fp_match_mask_scalar(fps, count, fp);
 #elif TPHT_SIMD_MODE == TPHT_SIMD_AVX2
@@ -531,7 +557,13 @@ static uint32_t tpht_fp_match_mask(const uint8_t *fps, uint8_t count, uint8_t fp
 #endif
 #else
 #if defined(TPHT_X86_SIMD) && (defined(__GNUC__) || defined(__clang__))
+#if defined(__AVX2__)
+    /* Compiled for AVX2 already: a 256-bit compare handles every block size,
+     * so there is no count>16 branch and no per-lookup CPU feature test. */
+    return tpht_fp_match_mask_avx2(fps, count, fp);
+#else
     if (count > 16u && tpht_cpu_has_avx2()) return tpht_fp_match_mask_avx2(fps, count, fp);
+#endif
 #endif
 #if defined(TPHT_X86_SIMD) && (defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86_FP))
     return tpht_fp_match_mask_sse2(fps, count, fp);
@@ -657,16 +689,16 @@ TPHT_HOT uint8_t *tpht_pool_deref(tpht_table_t *t, uint64_t deref_key, uint8_t p
                                 unsigned key_bytes) {
     uint8_t flag = (uint8_t)(ptr >> 7u);
     uint8_t pos = (uint8_t)((ptr & 0x7fu) - 1u);
-    uint64_t seed = t->cfg.hash_seed;
-    size_t bin = tpht_bin_of(tpht_hash_w(deref_key, seed + (flag ? 0x200 : 0x100), key_bytes),
+    uint64_t bitflip = flag ? t->hash_bitflip_200 : t->hash_bitflip_100;
+    size_t bin = tpht_bin_of(tpht_xxh3_word_bitflip(deref_key, key_bytes, bitflip),
                              t->pool.bin_count);
     return tpht_pool_entry(&t->pool, bin, pos);
 }
 
 static uint8_t *tpht_pool_alloc(tpht_table_t *t, uint64_t deref_key, uint8_t *encoded_out,
                                 unsigned key_bytes) {
-    size_t bin1 = tpht_bin_of(tpht_hash_w(deref_key, t->cfg.hash_seed + 0x100, key_bytes), t->pool.bin_count);
-    size_t bin2 = tpht_bin_of(tpht_hash_w(deref_key, t->cfg.hash_seed + 0x200, key_bytes), t->pool.bin_count);
+    size_t bin1 = tpht_bin_of(tpht_xxh3_word_bitflip(deref_key, key_bytes, t->hash_bitflip_100), t->pool.bin_count);
+    size_t bin2 = tpht_bin_of(tpht_xxh3_word_bitflip(deref_key, key_bytes, t->hash_bitflip_200), t->pool.bin_count);
     uint8_t flag = 0;
     size_t bin = bin1;
     uint8_t *cnt;
@@ -676,10 +708,13 @@ static uint8_t *tpht_pool_alloc(tpht_table_t *t, uint64_t deref_key, uint8_t *en
 
     tpht_pool_lock_pair(t, bin1, bin2);
 
-    if (bin1 != bin2 && tpht_pool_count(&t->pool, bin1) > tpht_pool_count(&t->pool, bin2)) {
-        bin = bin2;
-        flag = 1;
-    }
+    /*
+     * Branchless two-choice: the comparison is a coin flip on real data, so a
+     * branch here mispredicts about half the time.  bin1 == bin2 needs no
+     * special case - flag 1 decodes through the second hash to the same bin.
+     */
+    flag = (uint8_t)(tpht_pool_count(&t->pool, bin1) > tpht_pool_count(&t->pool, bin2));
+    bin = flag ? bin2 : bin1;
 
     cnt = tpht_pool_count_ptr(&t->pool, bin);
     head = tpht_pool_head_ptr(&t->pool, bin);
@@ -841,6 +876,20 @@ static size_t tpht_flat_deref_slots(uint8_t entry_size, size_t capacity, size_t 
     return tpht_max_size(slots, 1u);
 }
 
+/*
+ * Touch one byte per page so the kernel maps every page at create time.  A
+ * calloc of many megabytes is lazy zero pages, and without this each first
+ * write during an insert pays a page fault - a latency spike in the middle of
+ * the workload, and a systematic handicap in any insert benchmark against an
+ * implementation that populates its arena up front.
+ */
+static void tpht_prefault(uint8_t *p, size_t bytes) {
+    size_t off;
+    if (!p) return;
+    for (off = 0; off < bytes; off += 4096u) ((volatile uint8_t *)p)[off] = p[off];
+    if (bytes) ((volatile uint8_t *)p)[bytes - 1u] = p[bytes - 1u];
+}
+
 static int tpht_alloc_flat_lines(tpht_table_t *t) {
     size_t bytes = t->base_count * (size_t)TPHT_FLAT_LINE_BYTES;
     uint8_t *raw;
@@ -864,6 +913,17 @@ static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
     t->value_size = t->cfg.value_size;
     t->key_bits = (uint8_t)(t->key_size * 8u);
     t->key_mask = t->key_bits >= 64u ? UINT64_MAX : ((UINT64_C(1) << t->key_bits) - 1u);
+    t->hash_bitflip =
+        (TPHT_XXH3_SECRET_08 ^ TPHT_XXH3_SECRET_16) -
+        (t->cfg.hash_seed ^ ((uint64_t)tpht_bswap32((uint32_t)t->cfg.hash_seed) << 32));
+    t->hash_bitflip_100 =
+        (TPHT_XXH3_SECRET_08 ^ TPHT_XXH3_SECRET_16) -
+        ((t->cfg.hash_seed + UINT64_C(0x100)) ^
+         ((uint64_t)tpht_bswap32((uint32_t)(t->cfg.hash_seed + UINT64_C(0x100))) << 32));
+    t->hash_bitflip_200 =
+        (TPHT_XXH3_SECRET_08 ^ TPHT_XXH3_SECRET_16) -
+        ((t->cfg.hash_seed + UINT64_C(0x200)) ^
+         ((uint64_t)tpht_bswap32((uint32_t)(t->cfg.hash_seed + UINT64_C(0x200))) << 32));
     t->pool.bin_size = t->cfg.bin_size ? t->cfg.bin_size : TPHT_DEFAULT_BIN_SIZE;
     if (t->pool.bin_size == 0 || t->pool.bin_size > 127u) return 0;
 
@@ -873,6 +933,9 @@ static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
         if (t->base_bits > t->key_bits) t->base_bits = t->key_bits;
         t->base_mask = ((UINT64_C(1) << t->base_bits) - 1u);
         t->key_quotient_size = (size_t)((t->key_bits - t->base_bits + 7u) / 8u);
+        t->quotient_mask = t->key_quotient_size >= 8u
+                               ? UINT64_MAX
+                               : ((UINT64_C(1) << (8u * t->key_quotient_size)) - 1u);
         t->inline_entry_size = t->key_quotient_size + t->value_size;
         /* Chained entries carry the next tiny pointer in their first byte. */
         t->pool_entry_size = 1u + t->inline_entry_size;
@@ -936,6 +999,7 @@ static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
         t->base_bits = t->flat_cloud_bits;
         t->base_mask = t->flat_cloud_mask;
         t->key_quotient_size = t->flat_qkey_bytes;
+        t->quotient_mask = t->flat_rem_mask;
         t->inline_entry_size = t->flat_entry_size;
         /*
          * Overflow entries are reached by a tiny pointer held in the home
@@ -981,6 +1045,15 @@ static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
         tpht_free_storage(t);
         return 0;
     }
+
+    tpht_prefault(t->heads, t->base_count);
+    tpht_prefault(t->flat_lines_raw,
+                  t->cfg.variant == TPHT_FLATTEN
+                      ? t->base_count * (size_t)TPHT_FLAT_LINE_BYTES + TPHT_FLAT_LINE_BYTES - 1u
+                      : 0u);
+    tpht_prefault(t->pool.entries,
+                  t->pool.bin_count * (size_t)t->pool.bin_size * t->pool.entry_size);
+    tpht_prefault(t->pool.cnt_head, t->pool.bin_count * 2u);
     return 1;
 }
 
@@ -993,12 +1066,16 @@ static size_t tpht_chained_base(tpht_table_t *t, const void *key) {
 }
 
 static tpht_status_t tpht_chained_get_raw(tpht_table_t *t, const void *key, void *value_out) {
-    size_t base = tpht_chained_base(t, key);
+    uint64_t key_word = tpht_key_word(t, key);
+    size_t base = tpht_base_from_word(t, key_word);
+    uint64_t key_quot = key_word >> t->base_bits;
     uint8_t *prev = &t->heads[base];
     while (*prev) {
         uint8_t *entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev, t->key_size);
-        if (tpht_stored_key_equal(t, entry + 1u, key)) {
-            if (value_out && t->value_size) memcpy(value_out, entry + 1u + t->key_quotient_size, t->value_size);
+        if (tpht_read_quotient(t, entry + 1u) == key_quot) {
+            if (value_out && t->value_size)
+                tpht_store_le(value_out, t->value_size,
+                              tpht_read_le(entry + 1u + t->key_quotient_size, t->value_size));
             return TPHT_OK;
         }
         prev = entry;
@@ -1008,32 +1085,67 @@ static tpht_status_t tpht_chained_get_raw(tpht_table_t *t, const void *key, void
 
 static tpht_status_t tpht_chained_insert_raw(tpht_table_t *t, const void *key,
                                              const void *value, int replace) {
-    size_t base = tpht_chained_base(t, key);
+    uint64_t key_word = tpht_key_word(t, key);
+    size_t base = tpht_base_from_word(t, key_word);
+    uint64_t key_quot = key_word >> t->base_bits;
     uint8_t *prev = &t->heads[base];
     uint8_t encoded;
     uint8_t *entry;
-    while (*prev) {
-        entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev, t->key_size);
-        if (tpht_stored_key_equal(t, entry + 1u, key)) {
-            if (!replace) return TPHT_EXISTS;
-            if (t->value_size) memcpy(entry + 1u + t->key_quotient_size, value, t->value_size);
-            return TPHT_OK;
+    if (replace) {
+        while (*prev) {
+            entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev, t->key_size);
+            if (tpht_read_quotient(t, entry + 1u) == key_quot) {
+                if (t->value_size)
+                    tpht_store_le(entry + 1u + t->key_quotient_size, t->value_size,
+                                  tpht_read_le(value, t->value_size));
+                return TPHT_OK;
+            }
+            prev = entry;
         }
-        prev = entry;
+    } else {
+        /* append only: no existence probe, just walk to the tail */
+        while (*prev) {
+            entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev, t->key_size);
+            prev = entry;
+        }
     }
 
     entry = tpht_pool_alloc(t, (uint64_t)(uintptr_t)prev, &encoded, t->key_size);
     if (!entry) return TPHT_FULL;
     *prev = encoded;
     entry[0] = 0;
-    tpht_write_quotient(t, entry + 1u, key);
-    if (t->value_size) memcpy(entry + 1u + t->key_quotient_size, value, t->value_size);
+#if TPHT_LITTLE_ENDIAN && defined(__SIZEOF_INT128__)
+    /*
+     * [quotient][value] written as two overlapping 8-byte stores instead of
+     * two byte loops over runtime sizes; the second store ends exactly at the
+     * entry's last byte.  Same trick as tpht_flat_write_payload.
+     */
+    if (t->key_quotient_size + t->value_size >= 8u) {
+        __extension__ typedef unsigned __int128 tpht_u128_t;
+        unsigned qv = (unsigned)(t->key_quotient_size + t->value_size);
+        tpht_u128_t v = ((tpht_u128_t)tpht_read_le(value, t->value_size)
+                         << (8u * t->key_quotient_size)) |
+                        key_quot;
+        uint64_t lo = (uint64_t)v;
+        uint64_t hi = (uint64_t)(v >> (8u * (qv - 8u)));
+        memcpy(entry + 1u, &lo, 8);
+        memcpy(entry + 1u + qv - 8u, &hi, 8);
+    } else
+#endif
+    {
+        tpht_write_quotient(t, entry + 1u, key);
+        if (t->value_size)
+            tpht_store_le(entry + 1u + t->key_quotient_size, t->value_size,
+                          tpht_read_le(value, t->value_size));
+    }
     tpht_size_inc(t);
     return TPHT_OK;
 }
 
 static tpht_status_t tpht_chained_remove_raw(tpht_table_t *t, const void *key) {
-    size_t base = tpht_chained_base(t, key);
+    uint64_t key_word = tpht_key_word(t, key);
+    size_t base = tpht_base_from_word(t, key_word);
+    uint64_t key_quot = key_word >> t->base_bits;
     uint8_t *prev = &t->heads[base];
     uint8_t *target = NULL;
     uint8_t *last_prev = NULL;
@@ -1042,7 +1154,7 @@ static tpht_status_t tpht_chained_remove_raw(tpht_table_t *t, const void *key) {
     while (*prev) {
         uint8_t encoded = *prev;
         uint8_t *entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, encoded, t->key_size);
-        if (tpht_stored_key_equal(t, entry + 1u, key)) {
+        if (tpht_read_quotient(t, entry + 1u) == key_quot) {
             target = entry;
         }
         last_prev = prev;
@@ -1110,7 +1222,7 @@ typedef struct tpht_flat_slot {
 TPHT_HOT void tpht_flat_locate(const tpht_table_t *t, uint64_t key, tpht_flat_loc_t *out,
                              unsigned key_bytes) {
     uint64_t rem = t->flat_quot_bits >= 64u ? 0u : (key >> t->flat_quot_bits);
-    uint64_t quot = (tpht_hash_w(rem, t->cfg.hash_seed, key_bytes) ^ key) & t->flat_quot_mask;
+    uint64_t quot = (tpht_xxh3_word_bitflip(rem, key_bytes, t->hash_bitflip) ^ key) & t->flat_quot_mask;
     out->rem = rem;
     out->fp = (uint8_t)(quot >> t->flat_cloud_bits);
     out->block = (size_t)(quot & t->flat_cloud_mask);
@@ -1120,7 +1232,7 @@ TPHT_HOT void tpht_flat_locate(const tpht_table_t *t, uint64_t key, tpht_flat_lo
 static uint64_t tpht_flat_rebuild_key(const tpht_table_t *t, size_t block, uint8_t fp,
                                       uint64_t rem, unsigned key_bytes) {
     uint64_t quot = ((uint64_t)fp << t->flat_cloud_bits) | (uint64_t)block;
-    uint64_t low = (tpht_hash_w(rem, t->cfg.hash_seed, key_bytes) ^ quot) & t->flat_quot_mask;
+    uint64_t low = (tpht_xxh3_word_bitflip(rem, key_bytes, t->hash_bitflip) ^ quot) & t->flat_quot_mask;
     return t->flat_quot_bits >= 64u ? low : (low | (rem << t->flat_quot_bits));
 }
 
@@ -1140,13 +1252,22 @@ static void tpht_flat_set_count(uint8_t *line, uint8_t count) {
     line[TPHT_FLAT_CONTROL_OFF] = (uint8_t)(count & TPHT_FLAT_COUNT_MASK);
 }
 
-static TPHT_UNUSED uint8_t tpht_flat_crystals(const tpht_table_t *t, const uint8_t *line) {
+/*
+ * Crystal count for a block's current tuple count.  It is re-derived from the
+ * count via the descriptor's small flat_crystals table; that table is a hot L1
+ * line, so the load resolves while the home block is still on its way from L2,
+ * unlike a count cached inside the block itself, which would have to wait on it.
+ */
+TPHT_HOT uint8_t tpht_flat_crystals(const tpht_table_t *t, const uint8_t *line) {
     return t->flat_crystals[tpht_flat_count(line)];
 }
 
-/* Seqlock version byte: odd while a writer owns the block. */
-static void tpht_flat_write_begin(uint8_t *line) { line[TPHT_FLAT_VERSION_OFF]++; }
-static void tpht_flat_write_end(uint8_t *line) { line[TPHT_FLAT_VERSION_OFF]++; }
+/*
+ * No writer fence is needed: this variant is sequential only, so the seqlock
+ * version byte (TPHT_FLAT_VERSION_OFF) is left unused.
+ */
+static void tpht_flat_write_begin(uint8_t *line) { (void)line; }
+static void tpht_flat_write_end(uint8_t *line) { (void)line; }
 
 /* First byte past the crystal region, and the anchor of the tiny pointers. */
 TPHT_HOT uint8_t tpht_flat_crystal_end(const tpht_table_t *t, uint8_t crystals) {
@@ -1181,12 +1302,41 @@ TPHT_HOT uint64_t tpht_flat_read_value(const tpht_table_t *t, const uint8_t *pay
 #endif
 }
 
-static void tpht_flat_write_value(const tpht_table_t *t, uint8_t *payload, uint64_t value) {
+TPHT_HOT void tpht_flat_write_value(const tpht_table_t *t, uint8_t *payload, uint64_t value) {
+#if TPHT_LITTLE_ENDIAN
+    /* Merge the value into the entry's last 8 bytes with one load and one
+     * store; a byte loop over a runtime value_size costs more than the whole
+     * write.  Needs the entry to span at least 8 bytes. */
+    if (t->value_size && t->flat_entry_size >= 8u) {
+        unsigned shift = 8u * (8u - t->value_size);
+        uint64_t w;
+        memcpy(&w, payload + t->flat_entry_size - 8u, 8);
+        w = (w & ~(t->flat_value_mask << shift)) | (value << shift);
+        memcpy(payload + t->flat_entry_size - 8u, &w, 8);
+        return;
+    }
+#endif
     tpht_store_le(payload + t->flat_qkey_bytes, t->value_size, value);
 }
 
-static void tpht_flat_write_payload(const tpht_table_t *t, uint8_t *payload, uint64_t rem,
+TPHT_HOT void tpht_flat_write_payload(const tpht_table_t *t, uint8_t *payload, uint64_t rem,
                                     uint64_t value) {
+#if TPHT_LITTLE_ENDIAN && defined(__SIZEOF_INT128__)
+    /*
+     * [remainder][value] written as two overlapping 8-byte stores instead of
+     * two byte loops over runtime sizes.  The second store ends exactly at the
+     * entry's last byte, so nothing beyond the entry is touched.
+     */
+    if (t->flat_entry_size >= 8u) {
+        __extension__ typedef unsigned __int128 tpht_u128_t;
+        tpht_u128_t v = ((tpht_u128_t)value << (8u * t->flat_qkey_bytes)) | rem;
+        uint64_t lo = (uint64_t)v;
+        uint64_t hi = (uint64_t)(v >> (8u * (t->flat_entry_size - 8u)));
+        memcpy(payload, &lo, 8);
+        memcpy(payload + t->flat_entry_size - 8u, &hi, 8);
+        return;
+    }
+#endif
     tpht_store_le(payload, t->flat_qkey_bytes, rem);
     tpht_store_le(payload + t->flat_qkey_bytes, t->value_size, value);
 }
@@ -1199,9 +1349,13 @@ static void tpht_flat_write_payload(const tpht_table_t *t, uint8_t *payload, uin
 static int tpht_flat_find(tpht_table_t *t, uint8_t *line, const tpht_flat_loc_t *loc,
                           tpht_flat_slot_t *out, unsigned key_bytes) {
     uint8_t count = tpht_flat_count(line);
-    uint8_t crystals = t->flat_crystals[count];
-    uint8_t crystal_end = tpht_flat_crystal_end(t, crystals);
-    uint32_t mask = tpht_fp_match_mask(line, count, loc->fp);
+    uint8_t crystals;
+    uint8_t crystal_end;
+    uint32_t mask;
+
+    crystals = tpht_flat_crystals(t, line);
+    crystal_end = tpht_flat_crystal_end(t, crystals);
+    mask = tpht_fp_match_mask(line, count, loc->fp);
 
     while (mask) {
         uint8_t i = tpht_ctz32(mask);
@@ -1280,7 +1434,7 @@ TPHT_HOT tpht_status_t tpht_flat_get_raw(tpht_table_t *t, uint64_t key, uint64_t
     tpht_flat_locate(t, key, &loc, key_bytes);
     line = tpht_flat_line(t, loc.block);
     count = tpht_flat_count(line);
-    crystals = t->flat_crystals[count];
+    crystals = tpht_flat_crystals(t, line);
     mask = tpht_fp_match_mask(line, count, loc.fp);
     crystal_end = tpht_flat_crystal_end(t, crystals);
 
@@ -1318,60 +1472,20 @@ TPHT_HOT tpht_status_t tpht_flat_get_raw(tpht_table_t *t, uint64_t key, uint64_t
     return TPHT_NOT_FOUND;
 }
 
-static tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, uint64_t key, uint64_t value,
-                                          int replace, unsigned key_bytes) {
-    tpht_flat_loc_t loc;
-    tpht_flat_slot_t slot;
-    uint8_t *line;
-    uint8_t count;
-    uint8_t crystals;
-    uint8_t next_crystals;
-    uint8_t crystal_end;
-
-    tpht_flat_locate(t, key, &loc, key_bytes);
-    line = tpht_flat_line(t, loc.block);
-
-    if (tpht_flat_find(t, line, &loc, &slot, key_bytes)) {
-        if (!replace) return TPHT_EXISTS;
-        tpht_flat_write_begin(line);
-        tpht_flat_write_value(t, slot.payload, value);
-        tpht_flat_write_end(line);
-        return TPHT_OK;
-    }
-
-    count = tpht_flat_count(line);
-    /* Hard overflow: the block cannot address another tuple. */
-    if (count >= TPHT_FLAT_MAX_TUPLES) {
-        t->flat_deref_pressure = 0u;
-        return TPHT_FULL;
-    }
-
-    crystals = t->flat_crystals[count];
-    next_crystals = t->flat_crystals[count + 1u];
-    crystal_end = tpht_flat_crystal_end(t, crystals);
-
-    if (next_crystals > crystals) {
-        /* The pair itself still fits in the line. */
-        uint8_t tps = (uint8_t)(count - crystals);
-        uint8_t new_end = (uint8_t)(crystal_end - t->flat_entry_size);
-        tpht_flat_write_begin(line);
-        if (tps) {
-            /* Tiny pointers stay anchored to the crystal region, and the new
-             * crystal's fingerprint takes index `crystals`. */
-            memmove(line + new_end - tps, line + crystal_end - tps, tps);
-            memmove(line + crystals + 1u, line + crystals, tps);
-        }
-        line[crystals] = loc.fp;
-        tpht_flat_write_payload(t, line + new_end, loc.rem, value);
-        tpht_flat_set_count(line, (uint8_t)(count + 1u));
-        tpht_flat_write_end(line);
-        tpht_size_inc(t);
-        return TPHT_OK;
-    }
-
+/*
+ * Soft overflow, deliberately out of line: it runs for a minority of inserts,
+ * but its eviction buffers would otherwise bloat every insert's stack frame
+ * and register saves - a measurable cost on the majority path.
+ */
+TPHT_NOINLINE static tpht_status_t tpht_flat_insert_soft(tpht_table_t *t, uint8_t *line,
+                                                         const tpht_flat_loc_t *locp,
+                                                         uint64_t value, uint8_t count,
+                                                         uint8_t crystals, uint8_t next_crystals,
+                                                         uint8_t crystal_end, unsigned key_bytes) {
+    tpht_flat_loc_t loc = *locp;
     {
         /*
-         * Soft overflow.  The new tuple goes to the dereference table, and so
+         * The new tuple goes to the dereference table, and so
          * does every inline tuple the block can no longer afford.  All the
          * dereference entries are reserved before the line is touched, so a
          * hard overflow there leaves the block exactly as it was.
@@ -1417,6 +1531,68 @@ static tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, uint64_t key, uint64_
         tpht_size_inc(t);
         return TPHT_OK;
     }
+}
+
+/*
+ * Force-inlined so a constant `replace` from the caller folds the existence
+ * probe (and its SIMD fingerprint match setup) out of the append path.
+ */
+TPHT_HOT tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, uint64_t key, uint64_t value,
+                                            int replace, unsigned key_bytes) {
+    tpht_flat_loc_t loc;
+    tpht_flat_slot_t slot;
+    uint8_t *line;
+    uint8_t count;
+    uint8_t crystals;
+    uint8_t next_crystals;
+    uint8_t crystal_end;
+
+    tpht_flat_locate(t, key, &loc, key_bytes);
+    line = tpht_flat_line(t, loc.block);
+
+    /*
+     * insert (replace == 0) appends unconditionally, so no existence probe is
+     * needed; only an overwrite (replace != 0) must locate the existing slot.
+     */
+    if (replace && tpht_flat_find(t, line, &loc, &slot, key_bytes)) {
+        tpht_flat_write_begin(line);
+        tpht_flat_write_value(t, slot.payload, value);
+        tpht_flat_write_end(line);
+        return TPHT_OK;
+    }
+
+    count = tpht_flat_count(line);
+    /* Hard overflow: the block cannot address another tuple. */
+    if (count >= TPHT_FLAT_MAX_TUPLES) {
+        t->flat_deref_pressure = 0u;
+        return TPHT_FULL;
+    }
+
+    crystals = t->flat_crystals[count];
+    next_crystals = t->flat_crystals[count + 1u];
+    crystal_end = tpht_flat_crystal_end(t, crystals);
+
+    if (next_crystals > crystals) {
+        /* The pair itself still fits in the line. */
+        uint8_t tps = (uint8_t)(count - crystals);
+        uint8_t new_end = (uint8_t)(crystal_end - t->flat_entry_size);
+        tpht_flat_write_begin(line);
+        if (tps) {
+            /* Tiny pointers stay anchored to the crystal region, and the new
+             * crystal's fingerprint takes index `crystals`. */
+            memmove(line + new_end - tps, line + crystal_end - tps, tps);
+            memmove(line + crystals + 1u, line + crystals, tps);
+        }
+        line[crystals] = loc.fp;
+        tpht_flat_write_payload(t, line + new_end, loc.rem, value);
+        tpht_flat_set_count(line, (uint8_t)(count + 1u));
+        tpht_flat_write_end(line);
+        tpht_size_inc(t);
+        return TPHT_OK;
+    }
+
+    return tpht_flat_insert_soft(t, line, &loc, value, count, crystals, next_crystals,
+                                 crystal_end, key_bytes);
 }
 
 static tpht_status_t tpht_flat_remove_raw(tpht_table_t *t, uint64_t key, unsigned key_bytes) {
@@ -1508,7 +1684,11 @@ static void tpht_flat_adopt(tpht_table_t *t, tpht_table_t *nt) {
     tpht_free_storage(t);
     t->capacity = nt->capacity;
     tpht_size_store(t, tpht_size_load(nt));
+    t->hash_bitflip = nt->hash_bitflip;
+    t->hash_bitflip_100 = nt->hash_bitflip_100;
+    t->hash_bitflip_200 = nt->hash_bitflip_200;
     t->key_quotient_size = nt->key_quotient_size;
+    t->quotient_mask = nt->quotient_mask;
     t->inline_entry_size = nt->inline_entry_size;
     t->pool_entry_size = nt->pool_entry_size;
     t->base_bits = nt->base_bits;
@@ -1608,17 +1788,21 @@ static tpht_status_t tpht_resize_locked(tpht_table_t *t, size_t new_capacity);
  * These never test a variant, a threading mode or a key width: the entry point
  * that calls them already knows all three.
  */
-static tpht_status_t tpht_flat_write(tpht_table_t *t, uint64_t key, uint64_t value, int replace,
-                                     unsigned key_bytes) {
+TPHT_HOT tpht_status_t tpht_flat_write(tpht_table_t *t, uint64_t key, uint64_t value, int replace,
+                                       unsigned key_bytes) {
     tpht_status_t st;
 
     if (t->cfg.resize_mode == TPHT_FIXED) {
         if (tpht_size_load(t) >= t->capacity) {
-            /* At capacity only an overwrite of a key already present succeeds. */
+            /*
+             * insert is append-only: at capacity there is no room for another
+             * entry, so it reports TPHT_FULL without probing.  Only an overwrite
+             * (replace != 0) may still look the key up and touch it in place.
+             */
+            if (!replace) return TPHT_FULL;
             uint64_t scratch;
             st = tpht_flat_get_raw(t, key, &scratch, key_bytes);
             if (st != TPHT_OK) return TPHT_FULL;
-            if (!replace) return TPHT_EXISTS;
         }
     } else if ((double)(tpht_size_load(t) + 1u) >
                (double)t->capacity * t->cfg.max_load_factor) {
@@ -1803,6 +1987,7 @@ static void tpht_chained_resize_commit(tpht_table_t *t) {
     t->key_size = nt->key_size;
     t->value_size = nt->value_size;
     t->key_quotient_size = nt->key_quotient_size;
+    t->quotient_mask = nt->quotient_mask;
     t->inline_entry_size = nt->inline_entry_size;
     t->pool_entry_size = nt->pool_entry_size;
     t->key_bits = nt->key_bits;
@@ -1975,12 +2160,9 @@ retry:
     }
     while (*prev) {
         entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev, t->key_size);
-        if (tpht_stored_key_equal(t, entry + 1u, key)) {
-            if (!replace) {
-                tpht_chain_unlock_base(t, base);
-                return TPHT_EXISTS;
-            }
-            memcpy(entry + 1u + t->key_quotient_size, value, t->value_size);
+        if (replace && tpht_stored_key_equal(t, entry + 1u, key)) {
+            tpht_store_le(entry + 1u + t->key_quotient_size, t->value_size,
+                          tpht_read_le(value, t->value_size));
             tpht_chain_unlock_base(t, base);
             return TPHT_OK;
         }
@@ -2002,7 +2184,8 @@ retry:
     *prev = encoded;
     entry[0] = 0;
     tpht_write_quotient(t, entry + 1u, key);
-    memcpy(entry + 1u + t->key_quotient_size, value, t->value_size);
+    tpht_store_le(entry + 1u + t->key_quotient_size, t->value_size,
+                  tpht_read_le(value, t->value_size));
     tpht_chain_unlock_base(t, base);
     return TPHT_OK;
 }
@@ -2026,7 +2209,8 @@ retry:
     while (*prev) {
         uint8_t *entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev, t->key_size);
         if (tpht_stored_key_equal(t, entry + 1u, key)) {
-            memcpy(entry + 1u + t->key_quotient_size, value, t->value_size);
+            tpht_store_le(entry + 1u + t->key_quotient_size, t->value_size,
+                          tpht_read_le(value, t->value_size));
             tpht_chain_unlock_base(t, base);
             return TPHT_OK;
         }
@@ -2123,7 +2307,11 @@ static tpht_status_t tpht_resize_locked(tpht_table_t *t, size_t new_capacity) {
     tpht_size_store(t, tpht_size_load(&nt));
     t->key_size = nt.key_size;
     t->value_size = nt.value_size;
+    t->hash_bitflip = nt.hash_bitflip;
+    t->hash_bitflip_100 = nt.hash_bitflip_100;
+    t->hash_bitflip_200 = nt.hash_bitflip_200;
     t->key_quotient_size = nt.key_quotient_size;
+    t->quotient_mask = nt.quotient_mask;
     t->inline_entry_size = nt.inline_entry_size;
     t->pool_entry_size = nt.pool_entry_size;
     t->key_bits = nt.key_bits;
@@ -2264,15 +2452,18 @@ static tpht_status_t tpht_chained_op_write(tpht_table_t *t, uint64_t key, uint64
     }
     tpht_lock(t);
     if (t->cfg.resize_mode == TPHT_FIXED && tpht_size_load(t) >= t->capacity) {
-        /* At capacity only an overwrite of a key already present succeeds. */
+        /*
+         * insert is append-only: at capacity report TPHT_FULL without probing;
+         * only an overwrite (replace != 0) may look the key up.
+         */
+        if (!replace) {
+            tpht_unlock(t);
+            return TPHT_FULL;
+        }
         st = tpht_chained_raw_get(t, key, NULL);
         if (st != TPHT_OK) {
             tpht_unlock(t);
             return TPHT_FULL;
-        }
-        if (!replace) {
-            tpht_unlock(t);
-            return TPHT_EXISTS;
         }
     }
     if (t->cfg.resize_mode == TPHT_RESIZABLE &&
