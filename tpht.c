@@ -65,8 +65,17 @@ typedef struct tpht_table tpht_table_t;
 
 #if defined(__GNUC__) || defined(__clang__)
 #define TPHT_UNUSED __attribute__((unused))
+/*
+ * The lookup path takes the key width as a parameter and every entry point
+ * passes a literal, which only pays off if the compiler specialises per call
+ * site.  Left to its own heuristics GCC clones the insert path but not the
+ * bigger lookup one, so the width stays a run-time argument and the hash
+ * branch survives.  Forcing the inline makes each entry point fold it away.
+ */
+#define TPHT_HOT static inline __attribute__((always_inline))
 #else
 #define TPHT_UNUSED
+#define TPHT_HOT static inline
 #endif
 
 #define TPHT_DEFAULT_BIN_SIZE 127u
@@ -167,6 +176,12 @@ struct tpht_table {
     uint64_t flat_value_mask; /* covers value_size */
     /* Crystal count for each possible tuple count; see tpht_flat_crystals_for. */
     uint8_t flat_crystals[TPHT_FLAT_MAX_TUPLES + 1u];
+    /*
+     * Byte offset of each crystal inside a block.  One table lookup replaces
+     * the multiply that both the crystal address and the tiny-pointer anchor
+     * would otherwise need, and removes their dependency on flat_entry_size.
+     */
+    uint8_t flat_crystal_off[TPHT_FLAT_MAX_TUPLES + 1u];
     /* Extra block-count doublings applied after hard overflows. */
     uint8_t flat_growth;
     /* Set when the last hard overflow came from the dereference table. */
@@ -389,7 +404,7 @@ static TPHT_UNUSED uint64_t tpht_xxh3_word(uint64_t word, uint32_t len, uint64_t
  * Hash one word with the function for a given key width.  Callers on a hot path
  * pass a literal, so the branch folds away and only one hash is compiled in.
  */
-static uint64_t tpht_hash_w(uint64_t word, uint64_t seed, unsigned key_bytes) {
+TPHT_HOT uint64_t tpht_hash_w(uint64_t word, uint64_t seed, unsigned key_bytes) {
     return key_bytes == 4u ? TPHT_HASH32(word, seed) : TPHT_HASH64(word, seed);
 }
 
@@ -638,7 +653,7 @@ static size_t tpht_bin_of(uint64_t hash, size_t n) {
 #endif
 }
 
-static uint8_t *tpht_pool_deref(tpht_table_t *t, uint64_t deref_key, uint8_t ptr,
+TPHT_HOT uint8_t *tpht_pool_deref(tpht_table_t *t, uint64_t deref_key, uint8_t ptr,
                                 unsigned key_bytes) {
     uint8_t flag = (uint8_t)(ptr >> 7u);
     uint8_t pos = (uint8_t)((ptr & 0x7fu) - 1u);
@@ -933,7 +948,10 @@ static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
             return 0;
         }
         for (x = 0; x <= TPHT_FLAT_MAX_TUPLES; ++x) {
+            uint32_t off = (x + 1u) * t->flat_entry_size;
             t->flat_crystals[x] = tpht_flat_crystals_for(t->flat_entry_size, x);
+            t->flat_crystal_off[x] =
+                off <= TPHT_FLAT_CONTROL_OFF ? (uint8_t)(TPHT_FLAT_CONTROL_OFF - off) : 0u;
         }
         overflow_slots = tpht_flat_deref_slots(t->flat_entry_size, t->capacity, t->base_count);
         overflow_slots = tpht_max_size(overflow_slots, t->flat_deref_floor);
@@ -1089,7 +1107,7 @@ typedef struct tpht_flat_slot {
  * the home block and whose high byte is the fingerprint.  The transform is
  * invertible, so those bits never have to be stored.
  */
-static void tpht_flat_locate(const tpht_table_t *t, uint64_t key, tpht_flat_loc_t *out,
+TPHT_HOT void tpht_flat_locate(const tpht_table_t *t, uint64_t key, tpht_flat_loc_t *out,
                              unsigned key_bytes) {
     uint64_t rem = t->flat_quot_bits >= 64u ? 0u : (key >> t->flat_quot_bits);
     uint64_t quot = (tpht_hash_w(rem, t->cfg.hash_seed, key_bytes) ^ key) & t->flat_quot_mask;
@@ -1110,11 +1128,11 @@ static uint64_t tpht_flat_deref_key(size_t block, uint8_t fp) {
     return ((uint64_t)block << 8u) | (uint64_t)fp;
 }
 
-static uint8_t *tpht_flat_line(tpht_table_t *t, size_t block) {
+TPHT_HOT uint8_t *tpht_flat_line(tpht_table_t *t, size_t block) {
     return t->flat_lines + (block << TPHT_FLAT_LINE_SHIFT);
 }
 
-static uint8_t tpht_flat_count(const uint8_t *line) {
+TPHT_HOT uint8_t tpht_flat_count(const uint8_t *line) {
     return (uint8_t)(line[TPHT_FLAT_CONTROL_OFF] & TPHT_FLAT_COUNT_MASK);
 }
 
@@ -1131,19 +1149,19 @@ static void tpht_flat_write_begin(uint8_t *line) { line[TPHT_FLAT_VERSION_OFF]++
 static void tpht_flat_write_end(uint8_t *line) { line[TPHT_FLAT_VERSION_OFF]++; }
 
 /* First byte past the crystal region, and the anchor of the tiny pointers. */
-static uint8_t tpht_flat_crystal_end(const tpht_table_t *t, uint8_t crystals) {
-    return (uint8_t)(TPHT_FLAT_CONTROL_OFF - (uint32_t)crystals * t->flat_entry_size);
+TPHT_HOT uint8_t tpht_flat_crystal_end(const tpht_table_t *t, uint8_t crystals) {
+    return crystals ? t->flat_crystal_off[crystals - 1u] : (uint8_t)TPHT_FLAT_CONTROL_OFF;
 }
 
-static uint8_t *tpht_flat_crystal(const tpht_table_t *t, uint8_t *line, uint8_t i) {
-    return line + TPHT_FLAT_CONTROL_OFF - ((uint32_t)i + 1u) * t->flat_entry_size;
+TPHT_HOT uint8_t *tpht_flat_crystal(const tpht_table_t *t, uint8_t *line, uint8_t i) {
+    return line + t->flat_crystal_off[i];
 }
 
 static uint8_t *tpht_flat_tp_slot(uint8_t *line, uint8_t crystal_end, uint8_t j) {
     return line + crystal_end - j - 1u;
 }
 
-static uint64_t tpht_flat_read_rem(const tpht_table_t *t, const uint8_t *payload) {
+TPHT_HOT uint64_t tpht_flat_read_rem(const tpht_table_t *t, const uint8_t *payload) {
 #if TPHT_LITTLE_ENDIAN
     uint64_t v;
     memcpy(&v, payload, 8);
@@ -1153,7 +1171,7 @@ static uint64_t tpht_flat_read_rem(const tpht_table_t *t, const uint8_t *payload
 #endif
 }
 
-static uint64_t tpht_flat_read_value(const tpht_table_t *t, const uint8_t *payload) {
+TPHT_HOT uint64_t tpht_flat_read_value(const tpht_table_t *t, const uint8_t *payload) {
 #if TPHT_LITTLE_ENDIAN
     uint64_t v;
     memcpy(&v, payload + t->flat_qkey_bytes, 8);
@@ -1248,7 +1266,8 @@ static void tpht_flat_promote(tpht_table_t *t, uint8_t *line, size_t block, uint
  * not the slot descriptor that insert and remove use to edit the block, and
  * building that descriptor costs more than the comparison itself.
  */
-static tpht_status_t tpht_flat_get_raw(tpht_table_t *t, uint64_t key, uint64_t *value_out,
+/* value_out must not be NULL; internal probes pass a scratch slot. */
+TPHT_HOT tpht_status_t tpht_flat_get_raw(tpht_table_t *t, uint64_t key, uint64_t *value_out,
                                        unsigned key_bytes) {
     tpht_flat_loc_t loc;
     uint8_t *line;
@@ -1280,7 +1299,7 @@ static tpht_status_t tpht_flat_get_raw(tpht_table_t *t, uint64_t key, uint64_t *
         const uint8_t *payload = tpht_flat_crystal(t, line, i);
         mask &= mask - 1u;
         if (tpht_flat_read_rem(t, payload) == loc.rem) {
-            if (value_out) *value_out = tpht_flat_read_value(t, payload);
+            *value_out = tpht_flat_read_value(t, payload);
             return TPHT_OK;
         }
     }
@@ -1292,7 +1311,7 @@ static tpht_status_t tpht_flat_get_raw(tpht_table_t *t, uint64_t key, uint64_t *
             tpht_pool_deref(t, tpht_flat_deref_key(loc.block, loc.fp), encoded, key_bytes);
         tp_mask &= tp_mask - 1u;
         if (tpht_flat_read_rem(t, payload) == loc.rem) {
-            if (value_out) *value_out = tpht_flat_read_value(t, payload);
+            *value_out = tpht_flat_read_value(t, payload);
             return TPHT_OK;
         }
     }
@@ -1508,6 +1527,7 @@ static void tpht_flat_adopt(tpht_table_t *t, tpht_table_t *nt) {
     t->flat_growth = nt->flat_growth;
     t->flat_deref_floor = nt->flat_deref_floor;
     memcpy(t->flat_crystals, nt->flat_crystals, sizeof(t->flat_crystals));
+    memcpy(t->flat_crystal_off, nt->flat_crystal_off, sizeof(t->flat_crystal_off));
     t->pool = nt->pool;
     nt->flat_lines = NULL;
     nt->flat_lines_raw = NULL;
@@ -1595,7 +1615,8 @@ static tpht_status_t tpht_flat_write(tpht_table_t *t, uint64_t key, uint64_t val
     if (t->cfg.resize_mode == TPHT_FIXED) {
         if (tpht_size_load(t) >= t->capacity) {
             /* At capacity only an overwrite of a key already present succeeds. */
-            st = tpht_flat_get_raw(t, key, NULL, key_bytes);
+            uint64_t scratch;
+            st = tpht_flat_get_raw(t, key, &scratch, key_bytes);
             if (st != TPHT_OK) return TPHT_FULL;
             if (!replace) return TPHT_EXISTS;
         }
@@ -1617,7 +1638,8 @@ static tpht_status_t tpht_flat_write(tpht_table_t *t, uint64_t key, uint64_t val
 
 static tpht_status_t tpht_flat_update_op(tpht_table_t *t, uint64_t key, uint64_t value,
                                          unsigned key_bytes) {
-    tpht_status_t st = tpht_flat_get_raw(t, key, NULL, key_bytes);
+    uint64_t scratch;
+    tpht_status_t st = tpht_flat_get_raw(t, key, &scratch, key_bytes);
     if (st != TPHT_OK) return st;
     return tpht_flat_insert_raw(t, key, value, 1, key_bytes);
 }
