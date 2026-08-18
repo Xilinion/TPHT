@@ -61,6 +61,22 @@ else
     echo "[tpht] skip forced_avx2: compiler/target does not support AVX2"
 fi
 
+if echo 'int main(void){return 0;}' | $CC $COMMON_FLAGS -mavx512bw -mavx512vl -mbmi2 -x c - -c -o "$BUILD_DIR/probe_avx512.o" >/dev/null 2>&1; then
+    if $CC $COMMON_FLAGS -mavx512bw -mavx512vl -mbmi2 -DTPHT_ENABLE_SIMD=1 -DTPHT_SIMD_MODE=5 \
+        "$ROOT/tpht.c" $TEST_SRCS -o "$BUILD_DIR/forced_avx512" >/dev/null 2>&1; then
+        if "$BUILD_DIR/forced_avx512" >/dev/null 2>&1; then
+            echo "[tpht] run forced_avx512"
+            "$BUILD_DIR/forced_avx512"
+        else
+            echo "[tpht] skip forced_avx512 run: binary built, CPU/runtime does not support AVX-512BW/VL"
+        fi
+    else
+        echo "[tpht] skip forced_avx512: TPHT AVX-512 build failed"
+    fi
+else
+    echo "[tpht] skip forced_avx512: compiler/target does not support AVX-512BW/VL"
+fi
+
 if can_preprocess '#ifndef __ARM_NEON
 #error no_neon
 #endif

@@ -55,6 +55,21 @@ typedef enum tpht_status {
  * TPHT_EXISTS is retained for API compatibility but insert no longer returns it.
  */
 
+/*
+ * How a table reacts to filling up.
+ *
+ *   TPHT_RESIZABLE  grows once its load passes max_load_factor, and keeps a
+ *                   running entry count in order to know when that happens.
+ *   TPHT_FIXED      never grows on load, and keeps no running count: capacity
+ *                   provisions the storage rather than capping it, so a write
+ *                   past capacity is not refused.  A hard overflow is still
+ *                   absorbed by rebuilding larger, exactly as for a resizable
+ *                   table, so writes do not report TPHT_FULL for fullness
+ *                   alone - only TPHT_NO_MEMORY if that rebuild cannot be
+ *                   allocated.  This is what makes a fixed table's writes the
+ *                   cheaper of the two; the cost lands on *_size(), which
+ *                   counts the table instead of reading a counter.
+ */
 typedef enum tpht_resize_mode {
     TPHT_FIXED = 0,
     TPHT_RESIZABLE = 1
@@ -76,6 +91,14 @@ typedef struct flatten_tpht32 flatten_tpht32_t;
 typedef struct flatten_tpht64 flatten_tpht64_t;
 typedef struct chained_tpht32 chained_tpht32_t;
 typedef struct chained_tpht64 chained_tpht64_t;
+
+/*
+ * Every *_size() below returns the number of entries held, duplicates from
+ * repeated insert included.  It is O(1) on a resizable table, which maintains
+ * a counter, and linear in the table on a fixed one, which does not - see
+ * tpht_resize_mode.  *_capacity() reports the capacity the table was built
+ * for; on a fixed table entries may exceed it.
+ */
 
 /* ------------------------------------------------------------------ flatten */
 /*

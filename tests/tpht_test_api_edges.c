@@ -27,13 +27,21 @@ static void run_api_edges_case(const tpht_test_case_t *tc) {
         for (i = 0; i < (uint64_t)fixed_capacity; ++i) {
             assert(t.insert(t.handle, i + 1000u, i + 9000u) == TPHT_OK);
         }
-        assert(t.insert(t.handle, 999999u, 1u) == TPHT_FULL);
-        /* An overwrite of a key already present still succeeds at capacity. */
+        /* A fixed table keeps no running size: capacity provisions its storage
+         * but is not a hard cap, so an insert past it absorbs the overflow by
+         * rebuilding with more blocks rather than reporting TPHT_FULL. */
+        assert(t.insert(t.handle, 999999u, 1u) == TPHT_OK);
+        tpht_test_assert_get(&t, tc, 999999u, 1u);
+        /* An overwrite of a key already present still succeeds. */
         assert(t.put(t.handle, 1000u, 77u) == TPHT_OK);
         tpht_test_assert_get(&t, tc, 1000u, 77u);
-        /* Append-only insert cannot acknowledge the existing key; the block is
-         * full so the append attempt reports TPHT_FULL. */
-        assert(t.insert(t.handle, 1000u, 5u) == TPHT_FULL);
+        /* Append-only insert cannot acknowledge the existing key, so this
+         * appends a duplicate rather than overwriting. */
+        assert(t.insert(t.handle, 1000u, 5u) == TPHT_OK);
+        /* Counted on demand for a fixed table: the loop's entries, the one that
+         * forced the rebuild, and the duplicate append.  The put overwrote an
+         * existing key, so it added nothing. */
+        assert(t.size(t.handle) == (size_t)fixed_capacity + 2u);
     }
     (void)out;
     t.destroy(t.handle);
