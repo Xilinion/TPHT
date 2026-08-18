@@ -49,11 +49,14 @@ void tpht_test_run_constructor_module(void) {
     assert(chained_tpht32_fixed_create(32, 9) == NULL);
     assert(chained_tpht64_fixed_create(32, 9) == NULL);
 
-    /* A NULL table is rejected, not dereferenced. */
-    assert(flatten_tpht32_put(NULL, 1, 1) == TPHT_INVALID);
-    assert(flatten_tpht64_get(NULL, 1, &v) == TPHT_INVALID);
-    assert(chained_tpht32_remove(NULL, 1) == TPHT_INVALID);
-    assert(chained_tpht64_update(NULL, 1, 1) == TPHT_INVALID);
+    /*
+     * A null handle is a caller bug, not a supported input: the read and write
+     * operations do not test for one.  Destroy is the exception and accepts
+     * null, as free does.
+     */
     flatten_tpht32_destroy(NULL);
+    flatten_tpht64_destroy(NULL);
+    chained_tpht32_destroy(NULL);
     chained_tpht64_destroy(NULL);
+    (void)v;
 }

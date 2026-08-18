@@ -3077,27 +3077,22 @@ flatten_tpht32_t *flatten_tpht32_resizable_create(size_t capacity, uint8_t value
 void flatten_tpht32_destroy(flatten_tpht32_t *table) { tpht_destroy_internal((tpht_table_t *)table); }
 
 tpht_status_t flatten_tpht32_put(flatten_tpht32_t *table, uint32_t key, uint64_t value) {
-    if (!table) return TPHT_INVALID;
     return tpht_flat_write((tpht_table_t *)table, key, value, 1, 4);
 }
 
 tpht_status_t flatten_tpht32_insert(flatten_tpht32_t *table, uint32_t key, uint64_t value) {
-    if (!table) return TPHT_INVALID;
     return tpht_flat_write((tpht_table_t *)table, key, value, 0, 4);
 }
 
 tpht_status_t flatten_tpht32_update(flatten_tpht32_t *table, uint32_t key, uint64_t value) {
-    if (!table) return TPHT_INVALID;
     return tpht_flat_update_op((tpht_table_t *)table, key, value, 4);
 }
 
 tpht_status_t flatten_tpht32_get(flatten_tpht32_t *table, uint32_t key, uint64_t *value_out) {
-    if (!table || !value_out) return TPHT_INVALID;
     return tpht_flat_get_raw((tpht_table_t *)table, key, value_out, 4);
 }
 
 tpht_status_t flatten_tpht32_remove(flatten_tpht32_t *table, uint32_t key) {
-    if (!table) return TPHT_INVALID;
     return tpht_flat_remove_raw((tpht_table_t *)table, key, 4);
 }
 
@@ -3124,27 +3119,22 @@ flatten_tpht64_t *flatten_tpht64_resizable_create(size_t capacity, uint8_t value
 void flatten_tpht64_destroy(flatten_tpht64_t *table) { tpht_destroy_internal((tpht_table_t *)table); }
 
 tpht_status_t flatten_tpht64_put(flatten_tpht64_t *table, uint64_t key, uint64_t value) {
-    if (!table) return TPHT_INVALID;
     return tpht_flat_write((tpht_table_t *)table, key, value, 1, 8);
 }
 
 tpht_status_t flatten_tpht64_insert(flatten_tpht64_t *table, uint64_t key, uint64_t value) {
-    if (!table) return TPHT_INVALID;
     return tpht_flat_write((tpht_table_t *)table, key, value, 0, 8);
 }
 
 tpht_status_t flatten_tpht64_update(flatten_tpht64_t *table, uint64_t key, uint64_t value) {
-    if (!table) return TPHT_INVALID;
     return tpht_flat_update_op((tpht_table_t *)table, key, value, 8);
 }
 
 tpht_status_t flatten_tpht64_get(flatten_tpht64_t *table, uint64_t key, uint64_t *value_out) {
-    if (!table || !value_out) return TPHT_INVALID;
     return tpht_flat_get_raw((tpht_table_t *)table, key, value_out, 8);
 }
 
 tpht_status_t flatten_tpht64_remove(flatten_tpht64_t *table, uint64_t key) {
-    if (!table) return TPHT_INVALID;
     return tpht_flat_remove_raw((tpht_table_t *)table, key, 8);
 }
 
@@ -3183,27 +3173,22 @@ chained_tpht32_t *chained_tpht32_concurrent_resizable_create(size_t capacity, ui
 void chained_tpht32_destroy(chained_tpht32_t *table) { tpht_destroy_internal((tpht_table_t *)table); }
 
 tpht_status_t chained_tpht32_put(chained_tpht32_t *table, uint32_t key, uint64_t value) {
-    if (!table) return TPHT_INVALID;
     return tpht_chained_op_write((tpht_table_t *)table, key, value, 1);
 }
 
 tpht_status_t chained_tpht32_insert(chained_tpht32_t *table, uint32_t key, uint64_t value) {
-    if (!table) return TPHT_INVALID;
     return tpht_chained_op_write((tpht_table_t *)table, key, value, 0);
 }
 
 tpht_status_t chained_tpht32_update(chained_tpht32_t *table, uint32_t key, uint64_t value) {
-    if (!table) return TPHT_INVALID;
     return tpht_chained_op_update((tpht_table_t *)table, key, value);
 }
 
 tpht_status_t chained_tpht32_get(chained_tpht32_t *table, uint32_t key, uint64_t *value_out) {
-    if (!table || !value_out) return TPHT_INVALID;
     return tpht_chained_op_get((tpht_table_t *)table, key, value_out);
 }
 
 tpht_status_t chained_tpht32_remove(chained_tpht32_t *table, uint32_t key) {
-    if (!table) return TPHT_INVALID;
     return tpht_chained_op_remove((tpht_table_t *)table, key);
 }
 
@@ -3242,27 +3227,22 @@ chained_tpht64_t *chained_tpht64_concurrent_resizable_create(size_t capacity, ui
 void chained_tpht64_destroy(chained_tpht64_t *table) { tpht_destroy_internal((tpht_table_t *)table); }
 
 tpht_status_t chained_tpht64_put(chained_tpht64_t *table, uint64_t key, uint64_t value) {
-    if (!table) return TPHT_INVALID;
     return tpht_chained_op_write((tpht_table_t *)table, key, value, 1);
 }
 
 tpht_status_t chained_tpht64_insert(chained_tpht64_t *table, uint64_t key, uint64_t value) {
-    if (!table) return TPHT_INVALID;
     return tpht_chained_op_write((tpht_table_t *)table, key, value, 0);
 }
 
 tpht_status_t chained_tpht64_update(chained_tpht64_t *table, uint64_t key, uint64_t value) {
-    if (!table) return TPHT_INVALID;
     return tpht_chained_op_update((tpht_table_t *)table, key, value);
 }
 
 tpht_status_t chained_tpht64_get(chained_tpht64_t *table, uint64_t key, uint64_t *value_out) {
-    if (!table || !value_out) return TPHT_INVALID;
     return tpht_chained_op_get((tpht_table_t *)table, key, value_out);
 }
 
 tpht_status_t chained_tpht64_remove(chained_tpht64_t *table, uint64_t key) {
-    if (!table) return TPHT_INVALID;
     return tpht_chained_op_remove((tpht_table_t *)table, key);
 }
 

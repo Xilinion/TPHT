@@ -9,7 +9,6 @@ static void run_api_edges_case(const tpht_test_case_t *tc) {
     uint64_t i;
 
     assert(t.handle != NULL);
-    assert(t.get(t.handle, 1, NULL) == TPHT_INVALID);
 
     assert(t.update(t.handle, 42u, 100u) == TPHT_NOT_FOUND);
     assert(t.remove(t.handle, 42u) == TPHT_NOT_FOUND);

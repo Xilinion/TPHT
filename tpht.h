@@ -40,8 +40,19 @@ typedef enum tpht_status {
     TPHT_EXISTS = 2,
     TPHT_FULL = 3,
     TPHT_NO_MEMORY = 4,
+    /* Retained for API compatibility; no operation returns it. */
     TPHT_INVALID = 5
 } tpht_status_t;
+
+/*
+ * Preconditions, not checked.  Every operation below requires a table pointer
+ * returned by a create function and not yet destroyed, and every get requires
+ * somewhere to put the value.  Passing null for either is a bug in the caller,
+ * and these functions do not test for it: the check would cost a branch on
+ * every operation to restate something the caller already knows.  A create
+ * function returning null is the one case worth testing, and it is the caller's
+ * job to test it.  Only *_destroy tolerates null, as free does.
+ */
 
 /*
  * The three write operations:
