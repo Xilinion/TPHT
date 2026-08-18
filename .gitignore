@@ -2,6 +2,7 @@
 /build/
 /build-*/
 /cmake-build-*/
+/results/
 
 # CMake-generated files (for in-source builds)
 /CMakeCache.txt
