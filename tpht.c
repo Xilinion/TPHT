@@ -159,29 +159,25 @@ typedef struct tpht_table tpht_table_t;
  */
 #define TPHT_FLAT_LINE_BYTES 64u
 #define TPHT_FLAT_LINE_SHIFT 6u
+/*
+ * Byte 63 is the seqlock version a concurrent flattened variant needs.  It is
+ * reserved unconditionally - never read, never written - so that variant can be
+ * added without changing the shape of an existing block.
+ */
 #define TPHT_FLAT_VERSION_OFF 63u
-#define TPHT_FLAT_CONTROL_OFF 62u
-#define TPHT_FLAT_COUNT_BITS 5u
+/* Tuple count and crystal count, adjacent so both move in one 16-bit access. */
+#define TPHT_FLAT_CONTROL_OFF 61u
+#define TPHT_FLAT_CRYSTALS_OFF 62u
 #define TPHT_FLAT_COUNT_MASK 0x1fu
-/* Fixed-point shift for the reciprocal that replaces the crystal division. */
-#define TPHT_FLAT_RECIP_SHIFT 16u
 #define TPHT_FLAT_MAX_TUPLES 31u
 
-#ifndef TPHT_META_STRATEGY
-#define TPHT_META_STRATEGY 3
-#endif
-
-#if TPHT_META_STRATEGY == 3
-/* The packed field leaves 3 bits for crystals, so inline tuples cap there. */
-#define TPHT_FLAT_CRYSTAL_CAP 7u
-#else
-#define TPHT_FLAT_CRYSTAL_CAP TPHT_FLAT_MAX_TUPLES
-#endif
 
 /* Fingerprints are one quotiented byte, so the home array needs 8 spare bits. */
 #define TPHT_FLAT_FP_BITS 8u
 /* Usable bytes in a block once the control and version bytes are removed. */
 #define TPHT_FLAT_USABLE_BYTES (TPHT_FLAT_CONTROL_OFF)
+/* Both counts up by one, applied to the 16-bit metadata field. */
+#define TPHT_FLAT_META_CRYSTAL 0x0101u
 /* Extra dereference table capacity over the expected overflow, in percent. */
 #define TPHT_FLAT_DEREF_HEADROOM 50u
 
@@ -250,14 +246,6 @@ struct tpht_table {
     void *flat_lines_raw;
     uint8_t flat_entry_size; /* quotiented key bytes + value bytes. */
     uint8_t flat_cost;       /* inline cost per tuple: max(entry_size - 1, 1). */
-    uint32_t flat_cost_recip; /* ceil(2^16 / flat_cost), for the division-free form. */
-    /*
-     * One load answers both questions a block operation asks of its count:
-     * low byte is the crystal count, high byte the first byte past the crystal
-     * region.  Indexed by tuple count, so it replaces a table load plus a
-     * multiply with a single L1 hit.
-     */
-    uint16_t flat_meta_tab[TPHT_FLAT_MAX_TUPLES + 2u];
     /*
      * Bit x is set when a block already holding x tuples can take one more
      * inline, i.e. crystals(x + 1) == crystals(x) + 1.  The crystal count is a
@@ -961,8 +949,6 @@ static uint8_t tpht_flat_crystals_for(uint8_t entry_size, uint32_t x) {
     room = TPHT_FLAT_USABLE_BYTES - 2u * x;
     crystals = room / cost;
     if (crystals > x) crystals = x;
-    /* Strategy 3 stores the crystal count in 3 bits, so it caps here. */
-    if (crystals > TPHT_FLAT_CRYSTAL_CAP) crystals = TPHT_FLAT_CRYSTAL_CAP;
     return (uint8_t)crystals;
 }
 
@@ -1208,8 +1194,6 @@ static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
             return 0;
         }
         t->flat_cost = t->flat_entry_size > 1u ? (uint8_t)(t->flat_entry_size - 1u) : 1u;
-        t->flat_cost_recip =
-            (uint32_t)(((UINT32_C(1) << TPHT_FLAT_RECIP_SHIFT) + t->flat_cost - 1u) / t->flat_cost);
         t->flat_inline_ok = 0u;
         for (x = 0; x < TPHT_FLAT_MAX_TUPLES; ++x) {
             if (tpht_flat_crystals_for(t->flat_entry_size, x + 1u) ==
@@ -1219,11 +1203,6 @@ static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
         for (x = 0; x <= TPHT_FLAT_MAX_TUPLES; ++x) {
             uint32_t off = (x + 1u) * t->flat_entry_size;
             t->flat_crystals[x] = tpht_flat_crystals_for(t->flat_entry_size, x);
-            t->flat_meta_tab[x] = (uint16_t)(
-                t->flat_crystals[x] |
-                ((uint16_t)(TPHT_FLAT_CONTROL_OFF -
-                            (unsigned)t->flat_crystals[x] * t->flat_entry_size)
-                 << 8u));
             t->flat_crystal_off[x] =
                 off <= TPHT_FLAT_CONTROL_OFF ? (uint8_t)(TPHT_FLAT_CONTROL_OFF - off) : 0u;
         }
@@ -1455,17 +1434,19 @@ static tpht_status_t tpht_chained_remove_raw(tpht_table_t *t, const void *key) {
  *   [0 .. count)          fingerprint array, one byte per tuple, at most 31
  *   ...                   free space
  *   [end - tps .. end)    tiny pointers, one byte each, growing down from end
- *   [end .. 62)           inline tuples ("crystals"), entry_size bytes each,
- *                         also growing down, so end = 62 - crystals*entry_size
- *   byte 62               tuple count, in the low 5 bits
- *   byte 63               crystal count
+ *   [end .. 61)           inline tuples ("crystals"), entry_size bytes each,
+ *                         also growing down, so end = 61 - crystals*entry_size
+ *   byte 61               tuple count, in the low 5 bits
+ *   byte 62               crystal count
+ *   byte 63               reserved: the seqlock version a concurrent variant
+ *                         will need.  Never read, never written.
  *
- * The two count bytes are adjacent and are read and written as one 16-bit
- * field, so both arrive with the block's own cache miss and the ordinary
- * insert bumps them with a single add.  How many tuples are inline is fully
- * determined by the tuple count and the entry size, so byte 63 is redundant
- * information kept for speed: deriving it instead would put a dependent table
- * load after the miss on every operation.  Insertion reduces to comparing
+ * Bytes 61 and 62 are adjacent and are read and written as one 16-bit field,
+ * so both counts arrive with the block's own cache miss and the ordinary
+ * insert bumps them with a single add.  Holding the crystal count outright
+ * rather than deriving it from the tuple count costs a byte of payload space
+ * and buys back the dependent table load that derivation would put after the
+ * miss on every insert, lookup and remove.  Insertion reduces to comparing
  * crystals(x) with crystals(x + 1):
  *
  *   crystals(x+1) == crystals(x) + 1   the new tuple fits inline
@@ -1478,15 +1459,13 @@ static tpht_status_t tpht_chained_remove_raw(tpht_table_t *t, const void *key) {
  * an entry.  Both are handled by rebuilding the table with more blocks; they
  * are never reported to the caller.
  *
- * TinyPtr spends the same two bytes but splits them differently: one control
- * byte holding a 3-bit crystal count and a 5-bit tiny pointer count, and one
- * byte reserved for a concurrency version.  Three bits are enough for its
- * crystal count only because its values are always 8 bytes, which caps inline
- * tuples at 7; TPHT supports 1-byte values, where a block holds about twenty,
- * so the crystal count needs a byte of its own.  The cost is that this variant
- * has no spare byte for a seqlock version - which is why it is sequential
- * only.  Making it concurrent would mean giving byte 63 back and deriving the
- * crystal count from the tuple count again.
+ * TinyPtr fits both counts into a single control byte - a 3-bit crystal count
+ * and a 5-bit tiny pointer count - and reserves one byte for concurrency, so
+ * it keeps 62 bytes of payload to TPHT's 61.  Three bits suffice there only
+ * because its values are always 8 bytes, which caps inline tuples at 7; TPHT
+ * supports 1-byte values, where a block can hold about twenty, and capping
+ * those at 7 was measured to roughly double the memory a small-value table
+ * needs.  The byte of payload is the cheaper thing to spend.
  * ------------------------------------------------------------------------- */
 
 typedef struct tpht_flat_loc {
@@ -1545,72 +1524,31 @@ TPHT_HOT uint8_t *tpht_flat_line(tpht_table_t *t, size_t block) {
  * variant will need, and spending it on metadata would make that impossible to
  * add later without changing the on-disk shape of every block.
  */
-/*
- * Strategies for holding a block's tuple count and crystal count.  The
- * internal representation is always a 16-bit value with the tuple count in the
- * low byte and the crystal count in the high byte; only how it is stored in,
- * and recovered from, the block differs.
- *
- *   1  two bytes: count in 62, crystals in 63.  Fastest to read, but it
- *      consumes the byte a concurrent variant needs for its seqlock version.
- *   2  one byte: count in 62; crystals recovered from the descriptor's
- *      flat_crystals table.  Costs one L1 load that depends on the count, so
- *      it lands after the block's own cache miss.
- *   3  one byte: crystals in the top 3 bits of 62, count in the low 5.  No
- *      second load and no arithmetic, at the price of capping inline tuples at
- *      7, which only binds for entry sizes below 7 bytes.
- *   4  one byte: count in 62; crystals recomputed as
- *      min((62 - 2*count) / cost, count) with the division done as a
- *      reciprocal multiply, so no divider and no dependent load.
- */
-/* Adding this to the packed byte/word appends one inline tuple. */
-#if TPHT_META_STRATEGY == 1
-#define TPHT_FLAT_META_CRYSTAL 0x0101u
-#elif TPHT_META_STRATEGY == 3
-#define TPHT_FLAT_META_CRYSTAL 0x21u /* count + 1 and crystals + 1 (bit 5) */
-#else
-#define TPHT_FLAT_META_CRYSTAL 0x01u
-#endif
 
 TPHT_HOT uint8_t tpht_flat_count(const uint8_t *line) {
     return (uint8_t)(line[TPHT_FLAT_CONTROL_OFF] & TPHT_FLAT_COUNT_MASK);
 }
 
 TPHT_HOT uint8_t tpht_flat_crystals(const tpht_table_t *t, const uint8_t *line) {
-#if TPHT_META_STRATEGY == 1
     (void)t;
-    return line[TPHT_FLAT_VERSION_OFF];
-#elif TPHT_META_STRATEGY == 3
-    (void)t;
-    return (uint8_t)(line[TPHT_FLAT_CONTROL_OFF] >> TPHT_FLAT_COUNT_BITS);
-#elif TPHT_META_STRATEGY == 5
-    return (uint8_t)t->flat_meta_tab[line[TPHT_FLAT_CONTROL_OFF] & TPHT_FLAT_COUNT_MASK];
-#elif TPHT_META_STRATEGY == 4
-    uint32_t count = line[TPHT_FLAT_CONTROL_OFF] & TPHT_FLAT_COUNT_MASK;
-    uint32_t room = TPHT_FLAT_USABLE_BYTES - 2u * count;
-    uint32_t c;
-    if (2u * count >= TPHT_FLAT_USABLE_BYTES) return 0;
-    c = (room * t->flat_cost_recip) >> TPHT_FLAT_RECIP_SHIFT;
-    return (uint8_t)(c > count ? count : c);
-#else
-    return t->flat_crystals[line[TPHT_FLAT_CONTROL_OFF] & TPHT_FLAT_COUNT_MASK];
-#endif
+    return line[TPHT_FLAT_CRYSTALS_OFF];
 }
 
-/* The block's stored metadata, as count in the low byte, crystals in the high. */
-TPHT_HOT uint16_t tpht_flat_meta(const tpht_table_t *t, const uint8_t *line) {
-#if TPHT_META_STRATEGY == 1
-    (void)t;
+/*
+ * Both counts as one value: tuple count in the low byte, crystal count in the
+ * high.  They live in adjacent bytes, so this is a single 16-bit load that
+ * arrives with the block's own cache miss - nothing downstream waits on a
+ * second access, and no table has to be consulted to learn how many tuples the
+ * block holds inline.
+ */
+TPHT_HOT uint16_t tpht_flat_meta(const uint8_t *line) {
 #if TPHT_LITTLE_ENDIAN
     uint16_t m;
     memcpy(&m, line + TPHT_FLAT_CONTROL_OFF, 2);
     return m;
 #else
     return (uint16_t)(line[TPHT_FLAT_CONTROL_OFF] |
-                      ((uint16_t)line[TPHT_FLAT_VERSION_OFF] << 8u));
-#endif
-#else
-    return (uint16_t)(tpht_flat_count(line) | ((uint16_t)tpht_flat_crystals(t, line) << 8u));
+                      ((uint16_t)line[TPHT_FLAT_CRYSTALS_OFF] << 8u));
 #endif
 }
 
@@ -1620,13 +1558,8 @@ TPHT_HOT uint8_t tpht_flat_meta_count(uint16_t meta) {
 
 TPHT_HOT uint8_t tpht_flat_meta_crystals(uint16_t meta) { return (uint8_t)(meta >> 8u); }
 
-/*
- * Append one inline tuple: bump whatever the block actually stores, in place.
- * Every strategy makes this a single read-modify-write of one byte, except the
- * two-byte layout where it is one 16-bit add.
- */
-TPHT_HOT void tpht_flat_bump_crystal(uint8_t *line) {
-#if TPHT_META_STRATEGY == 1
+/* Append one inline tuple: one 16-bit add, both counts at once. */
+TPHT_HOT void tpht_flat_add_crystal(uint8_t *line) {
 #if TPHT_LITTLE_ENDIAN
     uint16_t m;
     memcpy(&m, line + TPHT_FLAT_CONTROL_OFF, 2);
@@ -1634,29 +1567,17 @@ TPHT_HOT void tpht_flat_bump_crystal(uint8_t *line) {
     memcpy(line + TPHT_FLAT_CONTROL_OFF, &m, 2);
 #else
     line[TPHT_FLAT_CONTROL_OFF] = (uint8_t)(line[TPHT_FLAT_CONTROL_OFF] + 1u);
-    line[TPHT_FLAT_VERSION_OFF] = (uint8_t)(line[TPHT_FLAT_VERSION_OFF] + 1u);
-#endif
-#else
-    line[TPHT_FLAT_CONTROL_OFF] =
-        (uint8_t)(line[TPHT_FLAT_CONTROL_OFF] + TPHT_FLAT_META_CRYSTAL);
+    line[TPHT_FLAT_CRYSTALS_OFF] = (uint8_t)(line[TPHT_FLAT_CRYSTALS_OFF] + 1u);
 #endif
 }
 
 TPHT_HOT void tpht_flat_set_meta(uint8_t *line, uint8_t count, uint8_t crystals) {
-#if TPHT_META_STRATEGY == 1
-    uint16_t meta = (uint16_t)((count & TPHT_FLAT_COUNT_MASK) | ((uint16_t)crystals << 8u));
 #if TPHT_LITTLE_ENDIAN
-    memcpy(line + TPHT_FLAT_CONTROL_OFF, &meta, 2);
+    uint16_t m = (uint16_t)((count & TPHT_FLAT_COUNT_MASK) | ((uint16_t)crystals << 8u));
+    memcpy(line + TPHT_FLAT_CONTROL_OFF, &m, 2);
 #else
-    line[TPHT_FLAT_CONTROL_OFF] = (uint8_t)meta;
-    line[TPHT_FLAT_VERSION_OFF] = (uint8_t)(meta >> 8u);
-#endif
-#elif TPHT_META_STRATEGY == 3
-    line[TPHT_FLAT_CONTROL_OFF] =
-        (uint8_t)((count & TPHT_FLAT_COUNT_MASK) | (crystals << TPHT_FLAT_COUNT_BITS));
-#else
-    (void)crystals;
     line[TPHT_FLAT_CONTROL_OFF] = (uint8_t)(count & TPHT_FLAT_COUNT_MASK);
+    line[TPHT_FLAT_CRYSTALS_OFF] = crystals;
 #endif
 }
 
@@ -2031,7 +1952,7 @@ TPHT_HOT tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, uint64_t key, uint6
     }
 
     /* Both counts arrive in one 16-bit load, with the line's own cache miss. */
-    meta = tpht_flat_meta(t, line);
+    meta = tpht_flat_meta(line);
     count = tpht_flat_meta_count(meta);
     /* Hard overflow: the block cannot address another tuple. */
     if (TPHT_UNLIKELY(count >= TPHT_FLAT_MAX_TUPLES)) {
@@ -2039,16 +1960,8 @@ TPHT_HOT tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, uint64_t key, uint6
         return TPHT_FULL;
     }
 
-#if TPHT_META_STRATEGY == 5
-    {
-        uint16_t ce = t->flat_meta_tab[count];
-        crystals = (uint8_t)ce;
-        crystal_end = (uint8_t)(ce >> 8u);
-    }
-#else
     crystals = tpht_flat_meta_crystals(meta);
     crystal_end = tpht_flat_crystal_end(t, crystals);
-#endif
 
     /*
      * One more tuple fits inline iff crystals_for(count + 1) == crystals + 1,
@@ -2070,7 +1983,7 @@ TPHT_HOT tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, uint64_t key, uint6
         line[crystals] = loc.fp;
         tpht_flat_write_payload(t, line + new_end, loc.rem, value);
         /* Both counts up by one: one add on the 16-bit meta field. */
-        tpht_flat_bump_crystal(line);
+        tpht_flat_add_crystal(line);
         tpht_flat_write_end(line);
         if (t->tracks_size) tpht_size_inc_seq(t);
         return TPHT_OK;
@@ -2185,7 +2098,6 @@ static void tpht_flat_adopt(tpht_table_t *t, tpht_table_t *nt) {
     t->flat_lines_raw = nt->flat_lines_raw;
     t->flat_entry_size = nt->flat_entry_size;
     t->flat_cost = nt->flat_cost;
-    t->flat_cost_recip = nt->flat_cost_recip;
     t->flat_inline_ok = nt->flat_inline_ok;
     t->flat_qkey_bytes = nt->flat_qkey_bytes;
     t->flat_cloud_bits = nt->flat_cloud_bits;
@@ -2197,7 +2109,6 @@ static void tpht_flat_adopt(tpht_table_t *t, tpht_table_t *nt) {
     t->flat_growth = nt->flat_growth;
     t->flat_deref_floor = nt->flat_deref_floor;
     memcpy(t->flat_crystals, nt->flat_crystals, sizeof(t->flat_crystals));
-    memcpy(t->flat_meta_tab, nt->flat_meta_tab, sizeof(t->flat_meta_tab));
     memcpy(t->flat_crystal_off, nt->flat_crystal_off, sizeof(t->flat_crystal_off));
     t->pool = nt->pool;
     nt->flat_lines = NULL;

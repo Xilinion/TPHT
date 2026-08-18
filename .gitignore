@@ -1,0 +1,48 @@
+# Project build directories
+/build/
+/build-*/
+/cmake-build-*/
+
+# CMake-generated files (for in-source builds)
+/CMakeCache.txt
+/CMakeFiles/
+/CTestTestfile.cmake
+/Makefile
+/Testing/
+/cmake_install.cmake
+/compile_commands.json
+/install_manifest.txt
+
+# Compiled C/C++ artifacts
+*.a
+*.dll
+*.dylib
+*.exe
+*.la
+*.lo
+*.o
+*.obj
+*.out
+*.so
+*.so.*
+
+# Coverage and profiling output
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor and operating-system files
+*~
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/
