@@ -6,6 +6,16 @@
  * see the local xxHash attribution comment and README.md for details.
  */
 
+/*
+ * MADV_HUGEPAGE and MADV_POPULATE_WRITE hide behind _DEFAULT_SOURCE; under a
+ * strict -std=c11 build glibc leaves them undefined and the huge-page advice
+ * in tpht_advise_hugepages would silently compile away.  Declared before any
+ * header so it also covers whatever tpht.h pulls in.
+ */
+#if defined(__linux__) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE 1
+#endif
+
 #include "tpht.h"
 
 /*
@@ -34,6 +44,9 @@ typedef struct tpht_table tpht_table_t;
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 #ifndef TPHT_ENABLE_SIMD
 #define TPHT_ENABLE_SIMD 1
@@ -221,24 +234,32 @@ typedef struct tpht_table tpht_table_t;
 #define TPHT_FLAT_DEREF_HEADROOM 50u
 
 /*
- * Per-bin metadata stride.  Count, freelist head and (for a concurrent table)
- * the bin lock used to live in tightly packed arrays - 32 bins' counts or 64
+ * Per-bin metadata stride, in log2 - a per-table value now, because the two
+ * threadings want opposite layouts.  Concurrent: count, freelist head and the
+ * bin lock used to live in tightly packed arrays - 32 bins' counts or 64
  * bins' locks per cache line - so two threads touching unrelated bins fought
  * over the same line; the lock's xchg alone was half of a chained insert's
  * profile.  One 64-byte record per bin gives every bin its own line at a cost
- * of well under a byte per stored key.
+ * of well under a byte per stored key.  Sequential: there are no locks and no
+ * sharing, and the same 64-byte stride just turned the two-choice comparison
+ * into two scattered cache lines over a megabyte-scale array; two packed
+ * bytes per bin keep the whole metadata cache-resident, which is worth a few
+ * ns on every overflow insert.
  */
-#define TPHT_POOL_META_SHIFT 6u
+#define TPHT_POOL_META_SHIFT_CONC 6u
+#define TPHT_POOL_META_SHIFT_SEQ 1u
 #define TPHT_POOL_META_COUNT 0u
 #define TPHT_POOL_META_HEAD 1u
-#define TPHT_POOL_META_LOCK 2u
+#define TPHT_POOL_META_LOCK 2u /* concurrent records only; unused at the packed stride */
 
 typedef struct tpht_pool {
     uint8_t *entries;
-    uint8_t *cnt_head; /* 64-byte record per bin: [count, head, lock, pad]. */
+    uint8_t *cnt_head; /* per-bin record: [count, head] packed, or [count, head,
+                          lock, pad] on its own line - see meta_shift. */
     size_t bin_count;
-    size_t entry_size; /* next-byte + key + value. */
-    uint8_t locked;    /* concurrent table: bins carry a live lock byte. */
+    size_t entry_size;  /* next-byte + key + value. */
+    uint8_t locked;     /* concurrent table: bins carry a live lock byte. */
+    uint8_t meta_shift; /* log2 record stride: _SEQ packed or _CONC padded. */
 } tpht_pool_t;
 
 /*
@@ -397,9 +418,10 @@ struct tpht_table {
     uint8_t flat_crystal_off[TPHT_FLAT_MAX_TUPLES + 1u];
     /* Extra block-count doublings applied after hard overflows. */
     uint8_t flat_growth;
-    /* Set on a resize shadow: its pages are first touched by the parallel
-     * migration strides, so a serial prefault would only stall the resize
-     * starter while every other thread grinds an over-full table. */
+    /* Skip populating the arrays at allocation.  Almost never right: an
+     * unpopulated shadow pays a CoW break with a full TLB-shootdown IPI per
+     * first-written page mid-migration (see the concurrent resize starts),
+     * which measures far worse than the starter's one batched populate. */
     uint8_t no_prefault;
     /* Set when the last hard overflow came from the dereference table. */
     _Atomic uint8_t flat_deref_pressure; /* relaxed: heuristic read lock-free */
@@ -788,7 +810,10 @@ static uint64_t tpht_key_quotient(const tpht_table_t *t, const void *key) {
     return tpht_key_word(t, key) >> t->base_bits;
 }
 
-static size_t tpht_base_from_word(const tpht_table_t *t, uint64_t key_word) {
+/* Force-inlined: as a shared out-of-line helper it showed up as its own hot
+ * profile entry on the chained insert path - call overhead plus a reloaded
+ * hash constant on every chain operation. */
+TPHT_HOT size_t tpht_base_from_word(const tpht_table_t *t, uint64_t key_word) {
     uint64_t quotient = key_word >> t->base_bits;
     return (size_t)((tpht_xxh3_word_bitflip(quotient, t->key_size, t->hash_bitflip) ^ key_word) & t->base_mask);
 }
@@ -1095,13 +1120,13 @@ static void tpht_chain_lock_release(atomic_uchar *v) {
 
 static void tpht_pool_lock_bin(tpht_table_t *t, size_t bin) {
     if (t->pool.locked)
-        tpht_flag_lock((atomic_flag *)&t->pool.cnt_head[(bin << TPHT_POOL_META_SHIFT) |
+        tpht_flag_lock((atomic_flag *)&t->pool.cnt_head[(bin << t->pool.meta_shift) |
                                                         TPHT_POOL_META_LOCK]);
 }
 
 static void tpht_pool_unlock_bin(tpht_table_t *t, size_t bin) {
     if (t->pool.locked)
-        tpht_flag_unlock((atomic_flag *)&t->pool.cnt_head[(bin << TPHT_POOL_META_SHIFT) |
+        tpht_flag_unlock((atomic_flag *)&t->pool.cnt_head[(bin << t->pool.meta_shift) |
                                                           TPHT_POOL_META_LOCK]);
 }
 
@@ -1118,19 +1143,19 @@ static uint8_t *tpht_pool_entry(tpht_pool_t *p, size_t bin, uint8_t pos) {
  */
 static uint8_t tpht_pool_count(const tpht_pool_t *p, size_t bin) {
     return atomic_load_explicit(
-        (const _Atomic uint8_t *)&p->cnt_head[bin << TPHT_POOL_META_SHIFT],
+        (const _Atomic uint8_t *)&p->cnt_head[bin << p->meta_shift],
         memory_order_relaxed);
 }
 
 static void tpht_pool_count_add(tpht_pool_t *p, size_t bin, int delta) {
-    _Atomic uint8_t *c = (_Atomic uint8_t *)&p->cnt_head[bin << TPHT_POOL_META_SHIFT];
+    _Atomic uint8_t *c = (_Atomic uint8_t *)&p->cnt_head[bin << p->meta_shift];
     atomic_store_explicit(
         c, (uint8_t)(atomic_load_explicit(c, memory_order_relaxed) + delta),
         memory_order_relaxed);
 }
 
 static uint8_t *tpht_pool_head_ptr(tpht_pool_t *p, size_t bin) {
-    return &p->cnt_head[(bin << TPHT_POOL_META_SHIFT) | TPHT_POOL_META_HEAD];
+    return &p->cnt_head[(bin << p->meta_shift) | TPHT_POOL_META_HEAD];
 }
 
 /*
@@ -1374,6 +1399,75 @@ static void tpht_prefault(uint8_t *p, size_t bytes) {
     if (bytes) ((volatile uint8_t *)p)[bytes - 1u] = p[bytes - 1u];
 }
 
+/*
+ * Ask for transparent huge pages on a table-sized array.  A block table at 4K
+ * pages needs a dTLB entry per 64 lines, so a random-access workload larger
+ * than the TLB's reach pays a page-walk per operation; 2MB pages put the whole
+ * array under a handful of entries.  On madvise-mode kernels THP is granted
+ * only where asked, and the advice must precede the first touch to matter, so
+ * this runs right after the calloc and before any prefault.  Only the 2MB-
+ * aligned interior is eligible - the ragged edges stay 4K - and small arrays
+ * are left alone so a modest table does not round up to huge-page granularity.
+ */
+static void tpht_advise_hugepages(void *p, size_t bytes) {
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    const uintptr_t huge = (uintptr_t)2u << 20;
+    uintptr_t lo, hi;
+    if (!p || bytes < ((size_t)8u << 20)) return;
+    lo = ((uintptr_t)p + huge - 1u) & ~(huge - 1u);
+    hi = ((uintptr_t)p + bytes) & ~(huge - 1u);
+    if (hi > lo) (void)madvise((void *)lo, hi - lo, MADV_HUGEPAGE);
+#else
+    (void)p;
+    (void)bytes;
+#endif
+}
+
+/*
+ * Fault in one slice of an array, for the resize strides: slice idx of count,
+ * page-aligned so neighbouring slices never touch the same page twice.  The
+ * batched madvise populates without a trap per page - with huge pages, without
+ * a trap per 4K of a 2MB fault - and doing it here, before the migration takes
+ * any block seqlock, keeps fault stalls out of the sections writers wait on.
+ * The advice is best-effort: where it is unsupported the first-touch faults
+ * simply happen where they always did.
+ */
+static void tpht_populate_slice(uint8_t *p, size_t bytes, size_t idx, size_t count) {
+#if defined(__linux__) && defined(MADV_POPULATE_WRITE)
+    uintptr_t begin, end;
+    if (!p || !bytes || count == 0 || idx >= count) return;
+    /* Both bounds round down to a page, so the slices partition the pages
+     * exactly; a boundary page belongs to the slice that starts inside it.
+     * The edges may fall in pages the allocation only partly owns - those
+     * pages are still mapped (they hold the allocation's own bytes), so
+     * populating them is safe. */
+    begin = ((uintptr_t)p + bytes * idx / count) & ~(uintptr_t)4095u;
+    end = idx + 1u == count ? (uintptr_t)p + bytes
+                            : ((uintptr_t)p + bytes * (idx + 1u) / count) & ~(uintptr_t)4095u;
+    if (end > begin) (void)madvise((void *)begin, end - begin, MADV_POPULATE_WRITE);
+#else
+    (void)p;
+    (void)bytes;
+    (void)idx;
+    (void)count;
+#endif
+}
+
+/*
+ * Populate an array the huge-page-friendly way, then finish with the manual
+ * touch.  A trap-per-4K prefault into a MADV_HUGEPAGE region is granted huge
+ * pages only haphazardly - each touch is its own racy shot at an order-9
+ * allocation - where one MADV_POPULATE_WRITE of the range is granted them
+ * reliably, and maps the whole array in one syscall besides.  The touch after
+ * it is then a cheap sweep over already-present pages, and the whole prefault
+ * where the populate call does not exist.
+ */
+static void tpht_prefault_arr(uint8_t *p, size_t bytes) {
+    if (!p || !bytes) return;
+    tpht_populate_slice(p, bytes, 0, 1);
+    tpht_prefault(p, bytes);
+}
+
 static int tpht_alloc_flat_lines(tpht_table_t *t) {
     size_t bytes = t->base_count * (size_t)TPHT_FLAT_LINE_BYTES;
     uint8_t *raw;
@@ -1382,6 +1476,7 @@ static int tpht_alloc_flat_lines(tpht_table_t *t) {
     if (bytes / TPHT_FLAT_LINE_BYTES != t->base_count) return 0;
     raw = (uint8_t *)calloc(bytes + (TPHT_FLAT_LINE_BYTES - 1u) + TPHT_LOAD_SLACK, 1);
     if (!raw) return 0;
+    tpht_advise_hugepages(raw, bytes + (TPHT_FLAT_LINE_BYTES - 1u) + TPHT_LOAD_SLACK);
     t->flat_lines_raw = raw;
     addr = (uintptr_t)raw;
     addr = (addr + (TPHT_FLAT_LINE_BYTES - 1u)) & ~(uintptr_t)(TPHT_FLAT_LINE_BYTES - 1u);
@@ -1469,6 +1564,7 @@ static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
         t->pool_entry_size = 1u + t->inline_entry_size;
         t->pool.entry_size = t->pool_entry_size;
         t->heads = (uint8_t *)calloc(t->base_count, 1);
+        tpht_advise_hugepages(t->heads, t->base_count);
         overflow_slots = tpht_ceil_mul_div(t->capacity, TPHT_CHAINED_DEREF_LOAD_DEN,
                                            TPHT_CHAINED_DEREF_LOAD_NUM);
         if (!t->heads) {
@@ -1568,10 +1664,16 @@ static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
 
     t->pool.bin_count = (overflow_slots + TPHT_BIN_SIZE - 1u) / TPHT_BIN_SIZE;
     t->pool.bin_count = tpht_max_size(t->pool.bin_count, 1);
+    t->pool.meta_shift = t->cfg.threading == TPHT_CONCURRENT ? TPHT_POOL_META_SHIFT_CONC
+                                                             : TPHT_POOL_META_SHIFT_SEQ;
     t->pool.entries = (uint8_t *)calloc(
         t->pool.bin_count * (size_t)TPHT_BIN_SIZE * t->pool.entry_size + TPHT_LOAD_SLACK, 1);
+    tpht_advise_hugepages(t->pool.entries,
+                          t->pool.bin_count * (size_t)TPHT_BIN_SIZE * t->pool.entry_size +
+                              TPHT_LOAD_SLACK);
     t->pool.cnt_head =
-        (uint8_t *)calloc(t->pool.bin_count << TPHT_POOL_META_SHIFT, 1);
+        (uint8_t *)calloc(t->pool.bin_count << t->pool.meta_shift, 1);
+    tpht_advise_hugepages(t->pool.cnt_head, t->pool.bin_count << t->pool.meta_shift);
     t->pool.locked = t->cfg.threading == TPHT_CONCURRENT ? 1u : 0u;
 
     if (t->cfg.threading == TPHT_CONCURRENT) {
@@ -1594,7 +1696,7 @@ static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
         if (t->pool.cnt_head) {
             for (i = 0; i < t->pool.bin_count; ++i)
                 atomic_flag_clear(
-                    (atomic_flag *)&t->pool.cnt_head[(i << TPHT_POOL_META_SHIFT) |
+                    (atomic_flag *)&t->pool.cnt_head[(i << t->pool.meta_shift) |
                                                      TPHT_POOL_META_LOCK]);
         }
     }
@@ -1606,14 +1708,15 @@ static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
     }
 
     if (!t->no_prefault) {
-        tpht_prefault(t->heads, t->base_count);
-        tpht_prefault(t->flat_lines_raw,
-                      t->cfg.variant == TPHT_FLATTEN
-                          ? t->base_count * (size_t)TPHT_FLAT_LINE_BYTES + TPHT_FLAT_LINE_BYTES - 1u
-                          : 0u);
-        tpht_prefault(t->pool.entries,
-                      t->pool.bin_count * (size_t)TPHT_BIN_SIZE * t->pool.entry_size);
-        tpht_prefault(t->pool.cnt_head, t->pool.bin_count << TPHT_POOL_META_SHIFT);
+        tpht_prefault_arr(t->heads, t->base_count);
+        tpht_prefault_arr(t->flat_lines_raw,
+                          t->cfg.variant == TPHT_FLATTEN
+                              ? t->base_count * (size_t)TPHT_FLAT_LINE_BYTES +
+                                    TPHT_FLAT_LINE_BYTES - 1u
+                              : 0u);
+        tpht_prefault_arr(t->pool.entries,
+                          t->pool.bin_count * (size_t)TPHT_BIN_SIZE * t->pool.entry_size);
+        tpht_prefault_arr(t->pool.cnt_head, t->pool.bin_count << t->pool.meta_shift);
     }
     return 1;
 }
@@ -3250,7 +3353,17 @@ static int tpht_flat_conc_resize_start(tpht_table_t *t, size_t new_capacity, uin
      * ratcheting to ~1KB per stored key on a 200M-key growth run.
      */
     nt->flat_deref_floor = deref_floor;
-    nt->no_prefault = 1u;
+    /*
+     * The shadow is populated here, before resize_active flips, not lazily by
+     * the migration.  Lazy first touches looked cheaper but measured far
+     * worse: an insert's first access to a shadow line is a read of its count
+     * byte, which maps the shared zero page, and the write that follows
+     * breaks CoW with a TLB shootdown IPI to every core - a resize window's
+     * dominant kernel cost.  Populating up front is one batched, huge-page
+     * backed sweep (see tpht_prefault_arr), and only this thread waits:
+     * writers keep inserting into the old storage until the flip.
+     */
+    nt->no_prefault = 0u;
     if (!tpht_alloc_storage(nt, new_capacity)) {
         free(nt);
         tpht_flag_unlock(&t->resize_start_lock);
@@ -3367,6 +3480,18 @@ static void tpht_flat_resize_help_one(tpht_table_t *t) {
     tpht_resize_op_t *op = tpht_resize_op_snapshot(t);
     size_t stride;
     if (!op) return;
+    /*
+     * Once every stride is claimed, each in-flight insert still lands here
+     * until the last migrating thread commits - and a fetch_add per insert on
+     * one shared counter is a cache-line all writers serialize through.  The
+     * relaxed read costs a shared load instead; it may lag and skip a claim
+     * it could have made, which only leaves that stride to another helper.
+     */
+    if (atomic_load_explicit(&op->next_stride, memory_order_relaxed) >= op->stride_count) {
+        if (atomic_load_explicit(&op->done_strides, memory_order_acquire) >= op->stride_count)
+            tpht_flat_conc_resize_commit(t, op);
+        return;
+    }
     stride = atomic_fetch_add_explicit(&op->next_stride, 1u, memory_order_acq_rel);
     if (stride < op->stride_count)
         tpht_flat_resize_migrate_stride(t, op, stride);
@@ -3624,7 +3749,9 @@ static int tpht_chained_resize_start(tpht_table_t *t, size_t new_capacity, int b
     atomic_init(&nt->resize_op, NULL);
     atomic_flag_clear(&nt->lock);
     atomic_flag_clear(&nt->resize_start_lock);
-    nt->no_prefault = 1u;
+    /* Populated up front for the same reason as the flattened start: lazy
+     * first touches turn into CoW TLB-shootdown IPIs mid-migration. */
+    nt->no_prefault = 0u;
     if (!tpht_alloc_storage(nt, new_capacity)) {
         free(nt);
         tpht_flag_unlock(&t->resize_start_lock);
@@ -4223,7 +4350,7 @@ static size_t tpht_memory_of(const tpht_table_t *t) {
     if (!t) return 0;
     bytes = sizeof(*t);
     bytes += t->pool.bin_count * (size_t)TPHT_BIN_SIZE * t->pool.entry_size;
-    bytes += t->pool.bin_count << TPHT_POOL_META_SHIFT; /* pool bin metadata */
+    bytes += t->pool.bin_count << t->pool.meta_shift; /* pool bin metadata */
     bytes += TPHT_CHAIN_SLOT(t->chain_lock_count) * sizeof(*t->chain_locks);
     if (t->cfg.variant == TPHT_FLATTEN) {
         bytes += t->base_count * (size_t)TPHT_FLAT_LINE_BYTES; /* home array */

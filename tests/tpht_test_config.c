@@ -29,8 +29,10 @@ static size_t test_chained_storage_bytes(size_t capacity, uint8_t key_size, uint
     size_t entry_size = 1u + quotient_bytes + value_size;
     size_t slots = test_ceil_div(capacity * 100u, 95u);
     size_t bins = test_ceil_div(slots, TEST_BIN_SIZE);
-    /* One 64-byte metadata record per bin: count, freelist head, bin lock. */
-    return base_count + bins * TEST_BIN_SIZE * entry_size + bins * 64u;
+    /* Per-bin metadata: a sequential table packs count and freelist head into
+     * two bytes; only a concurrent table pads each record (with its bin lock)
+     * to its own 64-byte line. These creates are sequential. */
+    return base_count + bins * TEST_BIN_SIZE * entry_size + bins * 2u;
 }
 
 static void test_chained_layout(void) {
