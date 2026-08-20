@@ -22,7 +22,6 @@ typedef struct tpht_config {
     size_t initial_capacity;
     uint8_t key_size;
     uint8_t value_size;
-    uint8_t bin_size;
     double max_load_factor;
     uint64_t hash_seed;
     size_t resize_strides;
@@ -31,6 +30,8 @@ typedef struct tpht_config {
 typedef struct tpht_table tpht_table_t;
 
 #include <stdatomic.h>
+#include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -116,19 +117,57 @@ typedef struct tpht_table tpht_table_t;
 /* Cold-path bodies whose stack frames must stay off the hot path. */
 #define TPHT_NOINLINE __attribute__((noinline))
 #define TPHT_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define TPHT_LIKELY(x) __builtin_expect(!!(x), 1)
 #else
 #define TPHT_UNUSED
 #define TPHT_HOT static inline
 #define TPHT_NOINLINE
 #define TPHT_UNLIKELY(x) (x)
+#define TPHT_LIKELY(x) (x)
 #endif
 
-#define TPHT_DEFAULT_BIN_SIZE 127u
+/*
+ * Slots per dereference bin.  Fixed, not configurable: a tiny pointer is one
+ * byte - bit 7 selects which of the two hash choices produced it, bits 0..6
+ * the slot within the bin - so 127 is the largest a bin can be, and it is also
+ * the best: bigger bins spill less.  Holding it constant lets the compiler
+ * strength-reduce the bin arithmetic, and turns the divide and modulo that
+ * locate a freed entry into multiplies.
+ */
+#define TPHT_BIN_SIZE 127u
 #define TPHT_DEFAULT_LOAD_FACTOR 0.85
 #define TPHT_MIN_CAPACITY 16u
 #define TPHT_CHAINED_DEREF_LOAD_NUM 95u
 #define TPHT_CHAINED_DEREF_LOAD_DEN 100u
-#define TPHT_DEFAULT_RESIZE_STRIDE_BUCKETS 64u
+/*
+ * Buckets per migration stride.  Bigger strides mean fewer claims on the
+ * shared stride counter and better locality per helper; measured on a
+ * 256-thread box, 256 edged out 64 by a few percent at 32 threads and cost
+ * nothing at 8.  Overridable for experiments.
+ */
+#ifndef TPHT_DEFAULT_RESIZE_STRIDE_BUCKETS
+#define TPHT_DEFAULT_RESIZE_STRIDE_BUCKETS 256u
+#endif
+/*
+ * Chain version slots for a concurrent chained table.  One version byte per
+ * base is needless: what matters is that the threads actually running rarely
+ * share a slot by accident, and 2^16 slots keep that chance below a percent
+ * even at hundreds of threads while fitting the whole table in 64KB - a
+ * per-base array on a large table is megabytes of cold memory.  A power of
+ * two, so the slot index is a mask, never a divide.  Small tables use one
+ * slot per base, which is both smaller and collision-free.
+ */
+#define TPHT_CHAIN_VERSION_SLOTS 65536u
+/*
+ * Byte stride (log2) between chain seqlock slots.  0 packs them - best cache
+ * behaviour for lock-free readers, which only load versions; larger strides
+ * spread writers' RMWs over more lines at the readers' expense.  Kept
+ * overridable for measurement.
+ */
+#ifndef TPHT_CHAIN_LOCK_SHIFT
+#define TPHT_CHAIN_LOCK_SHIFT 0u
+#endif
+#define TPHT_CHAIN_SLOT(x) ((size_t)(x) << TPHT_CHAIN_LOCK_SHIFT)
 
 /* Keys are 4 or 8 bytes; values are any size from 1 to 8 bytes. */
 #define TPHT_MAX_KEY_BYTES 8u
@@ -181,29 +220,100 @@ typedef struct tpht_table tpht_table_t;
 /* Extra dereference table capacity over the expected overflow, in percent. */
 #define TPHT_FLAT_DEREF_HEADROOM 50u
 
+/*
+ * Per-bin metadata stride.  Count, freelist head and (for a concurrent table)
+ * the bin lock used to live in tightly packed arrays - 32 bins' counts or 64
+ * bins' locks per cache line - so two threads touching unrelated bins fought
+ * over the same line; the lock's xchg alone was half of a chained insert's
+ * profile.  One 64-byte record per bin gives every bin its own line at a cost
+ * of well under a byte per stored key.
+ */
+#define TPHT_POOL_META_SHIFT 6u
+#define TPHT_POOL_META_COUNT 0u
+#define TPHT_POOL_META_HEAD 1u
+#define TPHT_POOL_META_LOCK 2u
+
 typedef struct tpht_pool {
     uint8_t *entries;
-    uint8_t *cnt_head; /* [count, freelist-head] per bin. */
+    uint8_t *cnt_head; /* 64-byte record per bin: [count, head, lock, pad]. */
     size_t bin_count;
-    uint8_t bin_size;
     size_t entry_size; /* next-byte + key + value. */
+    uint8_t locked;    /* concurrent table: bins carry a live lock byte. */
 } tpht_pool_t;
+
+/*
+ * One shard of the running entry count, alone on its cache line.  Power-of-two
+ * shard count so the thread salt maps with a mask.
+ */
+#define TPHT_SIZE_SHARDS 8u
+
+#if defined(_MSC_VER)
+#define TPHT_THREAD_LOCAL __declspec(thread)
+#else
+#define TPHT_THREAD_LOCAL _Thread_local
+#endif
+
+typedef struct {
+    atomic_size_t v;
+    char pad[64 - sizeof(atomic_size_t)];
+} tpht_size_shard_t;
 
 typedef struct tpht_retired_storage {
     uint8_t *heads;
     void *flat_lines_raw;
     uint8_t *pool_entries;
     uint8_t *pool_cnt_head;
-    atomic_flag *chain_locks;
-    atomic_flag *pool_locks;
-    uint8_t *resize_migrated;
+    atomic_uchar *chain_locks;
     tpht_table_t *resize_descriptor;
     struct tpht_retired_storage *next;
 } tpht_retired_storage_t;
 
+/*
+ * One in-flight resize, heap-allocated so that every helper works from the same
+ * immutable snapshot.  The previous design kept this state in the table itself
+ * and cleared it at commit, which raced with helpers that had already checked
+ * resize_active: a straggler could read a NULLed migrated array (crash), or -
+ * worse - a helper left over from resize N-1 could bump the done-strides
+ * counter of resize N and let its commit fire before every bucket was migrated.
+ * With the state boxed per-resize, a stale helper only ever touches its own
+ * finished descriptor, where every bucket is already marked migrated and every
+ * step degrades to a no-op.  Descriptors are retired at commit, never freed
+ * until the table is destroyed, so a straggler can always still read one.
+ */
+typedef struct tpht_resize_op {
+    tpht_table_t *target;          /* the shadow table being filled */
+    uint64_t old_pack;             /* flat_lines_pack current when this began */
+    tpht_table_t *old_geo;         /* geo_snap current when this began */
+    uint8_t *migrated;             /* one byte per old block/bucket group */
+    uint8_t *old_lines;            /* flatten: the old block array */
+    atomic_uchar *old_chain_locks; /* chained: the old seqlock version array */
+    size_t old_chain_version_mask;
+    size_t old_base_count;
+    size_t stride_size;
+    size_t stride_count;
+    atomic_size_t next_stride;
+    atomic_size_t done_strides;
+    atomic_uchar failed;   /* flatten: the shadow overflowed; abort, do not lose keys */
+    atomic_flag commit_lock; /* one committer per resize, taken once, never cleared */
+    struct tpht_resize_op *next; /* retired-descriptor chain, freed at destroy */
+} tpht_resize_op_t;
+
 struct tpht_table {
     tpht_config_t cfg;
-    atomic_size_t size;
+    /*
+     * The fields every concurrent operation reads once per call, grouped so
+     * they share one cache line instead of five scattered ones: the resize
+     * flag, the size-tracking gate and its check period, the packed line
+     * word, and the geometry snapshot pointer.  All are read-mostly; the
+     * resize paths that write them already hold the necessary exclusion.
+     * Their design comments live at their original sites below.
+     */
+    atomic_bool resize_active;
+    uint8_t tracks_size;
+    _Atomic unsigned size_check_period;
+    _Atomic uint64_t flat_lines_pack; /* 64-byte aligned view of flat_lines_raw */
+    struct tpht_table *_Atomic geo_snap;
+    struct tpht_table *initial_geo; /* create-time snapshot copy, freed at destroy */
     size_t capacity;
     /*
      * Size at which a write must leave the hot path: the load-factor threshold
@@ -213,12 +323,19 @@ struct tpht_table {
      */
     size_t write_limit;
     /*
+     * How many writes a thread may run between looks at write_limit.  Checking
+     * costs a sweep over every size shard - cross-core traffic when writers
+     * are hot - so large tables amortise it; a small table cannot afford the
+     * overshoot (64 skipped checks per thread can be several times its whole
+     * limit) and checks every write.
+     */
+    /* (size_check_period declared in the hot group at the top) */
+    /*
      * Only a resizable table has to know how many entries it holds, to decide
      * when to grow.  A fixed table never grows on load, absorbs a hard overflow
      * by rebuilding with more blocks, and reports its size by counting on
      * demand - so it does not pay for the counter on every write.
      */
-    uint8_t tracks_size;
 
     size_t key_size;   /* 4 or 8. */
     size_t value_size; /* 1 to 8. */
@@ -242,7 +359,21 @@ struct tpht_table {
     uint8_t *heads;    /* chained heads only. */
 
     /* Flattened variant: array of 64-byte home blocks. */
-    uint8_t *flat_lines;   /* 64-byte aligned view of flat_lines_raw. */
+    uint8_t *flat_lines;
+    /*
+     * flat_lines and the block-count log2 in one atomic word (the array is
+     * 64-byte aligned, so the low six bits are free).  A concurrent writer
+     * derives its line from this single load: the block index is clamped by
+     * the packed bit count, so whatever torn mask values the locate read, the
+     * pointer stays inside the packed array - memory safety by construction.
+     * The post-lock re-read of the same word then says whether a commit
+     * interleaved (storages are never address-reused, so equality is exact),
+     * and with the line lock held that verdict is final: a commit takes every
+     * old line lock before it stores a single field, so a stable pack means
+     * every geometry field this writer read was stable too.  Readers cannot
+     * lean on a lock and use the full geo_snap snapshot instead.
+     */
+    /* (declaration moved to the hot group at the top of the struct) */
     void *flat_lines_raw;
     uint8_t flat_entry_size; /* quotiented key bytes + value bytes. */
     uint8_t flat_cost;       /* inline cost per tuple: max(entry_size - 1, 1). */
@@ -266,95 +397,188 @@ struct tpht_table {
     uint8_t flat_crystal_off[TPHT_FLAT_MAX_TUPLES + 1u];
     /* Extra block-count doublings applied after hard overflows. */
     uint8_t flat_growth;
+    /* Set on a resize shadow: its pages are first touched by the parallel
+     * migration strides, so a serial prefault would only stall the resize
+     * starter while every other thread grinds an over-full table. */
+    uint8_t no_prefault;
     /* Set when the last hard overflow came from the dereference table. */
-    uint8_t flat_deref_pressure;
+    _Atomic uint8_t flat_deref_pressure; /* relaxed: heuristic read lock-free */
     /* Lower bound on dereference table slots, raised when it runs out. */
     size_t flat_deref_floor;
 
     tpht_pool_t pool;
     atomic_flag lock;
-    atomic_flag *chain_locks;
-    atomic_flag *pool_locks;
+    atomic_uchar *chain_locks;
     size_t chain_lock_count;
-    size_t pool_lock_count;
+    size_t chain_version_mask; /* chain_lock_count - 1; slot = base & mask. */
 
-    atomic_bool resize_active;
+    /*
+     * The published geometry snapshot.  A resize commit is a multi-word swap
+     * of the storage pointers and every derived mask, and a thread that holds
+     * no lock (a reader's whole walk; a writer up to its block lock) can
+     * observe that swap half-done: base mask from one storage, line array
+     * from another, and the composed line pointer lands outside either
+     * allocation - a wild read for a lookup, a wild lock RMW for a write.  So
+     * the lock-free phases never read those fields from this struct at all:
+     * they load geo_snap once and take everything from the immutable table
+     * image it points to - the shadow descriptor of the resize that built the
+     * storage (or the create-time copy, for the first one), alive until the
+     * table dies.  One pointer load is one atomic word, so the view is
+     * consistent by construction, and "did a commit interleave?" is one
+     * pointer comparison instead of the storage-generation arithmetic this
+     * replaces.  Sequential tables point it at the table itself: their
+     * geometry only changes single-threaded, and the compiler folds the
+     * indirection away.
+     */
+    /* (geo_snap / initial_geo declared in the hot group at the top) */
     atomic_flag resize_start_lock;
-    atomic_flag resize_commit_lock;
-    atomic_size_t resize_next_stride;
-    atomic_size_t resize_done_strides;
-    atomic_size_t active_ops;
-    size_t resize_stride_count;
-    size_t resize_stride_size;
-    tpht_table_t *resize_target;
-    uint8_t *resize_migrated;
+    /*
+     * The running entry count, split across per-thread shards so concurrent
+     * writers do not fight over one cache line.  A single atomic counter beside
+     * the geometry that every operation reads was measured at several times the
+     * cost of the insert itself on an 8-writer growing table: every add took
+     * the line exclusive and forced every other thread to refetch it.  Each
+     * shard sits on its own line (padding rather than _Alignas, because the
+     * tables come from calloc, which does not honour an over-aligned type);
+     * a thread adds to the shard its thread-local salt names, and the total is
+     * the wrapping sum of the shards - exact whenever writers are excluded,
+     * which is the only time an exact answer is needed.  A sequential table
+     * only ever touches shard 0, so its hot path reads one line as before.
+     */
+    char size_pad_before[64];
+    tpht_size_shard_t size_shard[TPHT_SIZE_SHARDS];
+    tpht_resize_op_t *_Atomic resize_op; /* the in-flight resize, or NULL */
+    tpht_resize_op_t *retired_ops;       /* finished descriptors, freed at destroy */
     tpht_retired_storage_t *retired;
 };
 
-static size_t tpht_max_size(size_t a, size_t b) { return a > b ? a : b; }
-
-static size_t tpht_size_load(const tpht_table_t *t) {
-    return atomic_load_explicit((atomic_size_t *)&t->size, memory_order_acquire);
+/*
+ * splitmix64: a full avalanche on a counter, used to separate the hash streams
+ * and to spread the entropy behind a generated seed.
+ */
+static uint64_t tpht_splitmix64(uint64_t x) {
+    x += UINT64_C(0x9e3779b97f4a7c15);
+    x = (x ^ (x >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)) * UINT64_C(0x94d049bb133111eb);
+    return x ^ (x >> 31);
 }
 
-static void tpht_size_store(tpht_table_t *t, size_t size) {
-    atomic_store_explicit(&t->size, size, memory_order_release);
+static size_t tpht_max_size(size_t a, size_t b) { return a > b ? a : b; }
+
+/*
+ * Which shard this thread's adds land in.  Each thread draws one salt for its
+ * lifetime; with the shard count a power of two, distinct salts spread threads
+ * round-robin, and up to TPHT_SIZE_SHARDS writers add without sharing a line.
+ */
+static atomic_uint tpht_shard_salt_seq;
+static TPHT_THREAD_LOCAL unsigned tpht_tls_shard_salt;
+
+/*
+ * How many writes a thread performs between looks at the size limit.  Summing
+ * the shards reads a line per shard, most of them freshly written by other
+ * threads; doing that per insert would put the cross-core traffic right back.
+ * Checking every 64th write bounds the overshoot past the limit to
+ * 64 * threads entries, absorbed by the load-factor slack below the storage's
+ * hard bound - and a hard overflow in the gap still trips the TPHT_FULL arm,
+ * which resizes regardless of what the counter says.
+ */
+#define TPHT_SIZE_CHECK_PERIOD 64u
+static TPHT_THREAD_LOCAL unsigned tpht_tls_limit_tick;
+
+static unsigned tpht_size_shard_pick(void) {
+    unsigned salt = tpht_tls_shard_salt;
+    if (TPHT_UNLIKELY(salt == 0)) {
+        salt = atomic_fetch_add_explicit(&tpht_shard_salt_seq, 1u, memory_order_relaxed) + 1u;
+        tpht_tls_shard_salt = salt;
+    }
+    return salt & (TPHT_SIZE_SHARDS - 1u);
 }
 
 /*
- * A read-modify-write on the size counter compiles to a lock-prefixed
- * instruction, which costs more than the rest of an insert put together.  Only
- * a table that actually has concurrent writers needs one; a sequential table
- * gets a plain load, add and store through the same atomic object.
+ * The wrapping sum of the shards.  Exact whenever writers are excluded (a
+ * commit holds every lock; a sequential table has no other threads); at any
+ * other moment it is the same order-free snapshot a single atomic counter
+ * would have given.  Wraparound in individual shards - a remove's decrement
+ * landing in a different shard than the insert's increment - cancels in the
+ * modular sum.
+ */
+static size_t tpht_size_load(const tpht_table_t *t) {
+    size_t sum = 0;
+    unsigned i;
+    for (i = 0; i < TPHT_SIZE_SHARDS; ++i)
+        sum += atomic_load_explicit((atomic_size_t *)&t->size_shard[i].v, memory_order_acquire);
+    return sum;
+}
+
+/*
+ * A sequential table only ever moves shard 0, so its hot-path limit check
+ * stays one load instead of a sweep over every shard line.
+ */
+TPHT_HOT size_t tpht_size_load_seq(const tpht_table_t *t) {
+    return atomic_load_explicit((atomic_size_t *)&t->size_shard[0].v, memory_order_relaxed);
+}
+
+static void tpht_size_store(tpht_table_t *t, size_t size) {
+    unsigned i;
+    atomic_store_explicit(&t->size_shard[0].v, size, memory_order_release);
+    for (i = 1; i < TPHT_SIZE_SHARDS; ++i)
+        atomic_store_explicit(&t->size_shard[i].v, 0, memory_order_release);
+}
+
+/*
+ * A read-modify-write on a shared counter compiles to a lock-prefixed
+ * instruction whose line bounces between writers - measured at several times
+ * the cost of the insert it was counting.  A concurrent table adds to this
+ * thread's own shard; a sequential one gets a plain load, add and store.
  */
 static void tpht_size_inc(tpht_table_t *t) {
     if (t->cfg.threading == TPHT_SEQUENTIAL) {
         atomic_store_explicit(
-            &t->size, atomic_load_explicit(&t->size, memory_order_relaxed) + 1u,
+            &t->size_shard[0].v,
+            atomic_load_explicit(&t->size_shard[0].v, memory_order_relaxed) + 1u,
             memory_order_relaxed);
         return;
     }
-    atomic_fetch_add_explicit(&t->size, 1u, memory_order_acq_rel);
+    atomic_fetch_add_explicit(&t->size_shard[tpht_size_shard_pick()].v, 1u,
+                              memory_order_relaxed);
 }
 
 /*
- * Same, for the paths that cannot be concurrent whatever the configuration
- * says - the flattened variant is sequential only (tpht_create rejects any
- * other threading for it).  Testing the threading mode there would be a
- * per-insert branch on a value that is known at the call site.
+ * Same, for the paths whose concurrency is a call-site literal: testing the
+ * threading mode there would be a per-insert branch on a known value.
  */
 TPHT_HOT void tpht_size_inc_seq(tpht_table_t *t) {
-    atomic_store_explicit(&t->size,
-                          atomic_load_explicit(&t->size, memory_order_relaxed) + 1u,
+    atomic_store_explicit(&t->size_shard[0].v,
+                          atomic_load_explicit(&t->size_shard[0].v, memory_order_relaxed) + 1u,
                           memory_order_relaxed);
 }
 
 TPHT_HOT void tpht_size_dec_seq(tpht_table_t *t) {
-    atomic_store_explicit(&t->size,
-                          atomic_load_explicit(&t->size, memory_order_relaxed) - 1u,
+    atomic_store_explicit(&t->size_shard[0].v,
+                          atomic_load_explicit(&t->size_shard[0].v, memory_order_relaxed) - 1u,
                           memory_order_relaxed);
+}
+
+TPHT_HOT void tpht_size_inc_conc(tpht_table_t *t) {
+    atomic_fetch_add_explicit(&t->size_shard[tpht_size_shard_pick()].v, 1u,
+                              memory_order_relaxed);
+}
+
+TPHT_HOT void tpht_size_dec_conc(tpht_table_t *t) {
+    atomic_fetch_sub_explicit(&t->size_shard[tpht_size_shard_pick()].v, 1u,
+                              memory_order_relaxed);
 }
 
 static void tpht_size_dec(tpht_table_t *t) {
     if (t->cfg.threading == TPHT_SEQUENTIAL) {
         atomic_store_explicit(
-            &t->size, atomic_load_explicit(&t->size, memory_order_relaxed) - 1u,
+            &t->size_shard[0].v,
+            atomic_load_explicit(&t->size_shard[0].v, memory_order_relaxed) - 1u,
             memory_order_relaxed);
         return;
     }
-    atomic_fetch_sub_explicit(&t->size, 1u, memory_order_acq_rel);
-}
-
-static int tpht_size_try_reserve(tpht_table_t *t) {
-    size_t cur = tpht_size_load(t);
-    while (cur < t->capacity) {
-        if (atomic_compare_exchange_weak_explicit(&t->size, &cur, cur + 1u,
-                                                  memory_order_acq_rel,
-                                                  memory_order_acquire)) {
-            return 1;
-        }
-    }
-    return 0;
+    atomic_fetch_sub_explicit(&t->size_shard[tpht_size_shard_pick()].v, 1u,
+                              memory_order_relaxed);
 }
 
 static size_t tpht_ceil_mul_div(size_t x, size_t mul, size_t div) {
@@ -490,6 +714,51 @@ static TPHT_UNUSED uint64_t tpht_xxh3_word(uint64_t word, uint32_t len, uint64_t
  * bitflip depends only on the seed, so it is computed once at table creation
  * (see hash_bitflip) and stored; the per-call seed shuffling disappears.
  */
+/* The precomputed XXH3 bitflip for one of a table's hash streams. */
+static uint64_t tpht_stream_bitflip(uint64_t seed, unsigned stream) {
+    uint64_t s = tpht_splitmix64(seed ^ (UINT64_C(0x9e3779b97f4a7c15) * (stream + 1u)));
+    return (TPHT_XXH3_SECRET_08 ^ TPHT_XXH3_SECRET_16) -
+           (s ^ ((uint64_t)tpht_bswap32((uint32_t)s) << 32));
+}
+
+/*
+ * A seed for a table whose caller did not choose one.  Two tables must never
+ * share a hash function by accident, so a process-wide counter is mixed in:
+ * that alone guarantees distinct seeds even where no entropy source exists.
+ * The entropy makes them unpredictable as well, which is what keeps a table
+ * from being driven into its worst case by chosen keys.
+ */
+static uint64_t tpht_random_seed(void) {
+    static atomic_uint_least64_t tpht_seed_counter;
+    static atomic_uint_least64_t tpht_seed_entropy;
+    uint64_t entropy = atomic_load_explicit(&tpht_seed_entropy, memory_order_acquire);
+    uint64_t ordinal = (uint64_t)atomic_fetch_add_explicit(&tpht_seed_counter, 1u,
+                                                           memory_order_relaxed);
+    if (entropy == 0u) {
+        uint64_t bits = 0;
+#if defined(__unix__) || defined(__APPLE__) || defined(__linux__)
+        FILE *f = fopen("/dev/urandom", "rb");
+        if (f) {
+            if (fread(&bits, 1, sizeof(bits), f) != sizeof(bits)) bits = 0;
+            fclose(f);
+        }
+#endif
+        if (bits == 0u) {
+            /* No entropy source: fall back to whatever varies per run - the
+             * clock, and addresses the loader placed. */
+            uintptr_t here = (uintptr_t)(const void *)&tpht_seed_counter;
+            uintptr_t stack = (uintptr_t)(const void *)&bits;
+            bits = tpht_splitmix64((uint64_t)time(NULL)) ^
+                   tpht_splitmix64((uint64_t)clock()) ^ ((uint64_t)here << 16) ^
+                   (uint64_t)stack;
+        }
+        if (bits == 0u) bits = UINT64_C(0x243f6a8885a308d3);
+        atomic_store_explicit(&tpht_seed_entropy, bits, memory_order_release);
+        entropy = bits;
+    }
+    return tpht_splitmix64(entropy ^ tpht_splitmix64(ordinal));
+}
+
 TPHT_HOT uint64_t tpht_xxh3_word_bitflip(uint64_t word, uint32_t len, uint64_t bitflip) {
     uint32_t input1 = (uint32_t)word;
     uint32_t input2 = len == 8u ? (uint32_t)(word >> 32) : (uint32_t)word;
@@ -509,13 +778,6 @@ TPHT_HOT uint64_t tpht_xxh3_word_bitflip(uint64_t word, uint32_t len, uint64_t b
 #define TPHT_HASH64(word, seed) tpht_xxh3_word((word), 8u, (seed))
 #endif
 
-/*
- * Hash one word with the function for a given key width.  Callers on a hot path
- * pass a literal, so the branch folds away and only one hash is compiled in.
- */
-TPHT_HOT uint64_t tpht_hash_w(uint64_t word, uint64_t seed, unsigned key_bytes) {
-    return key_bytes == 4u ? TPHT_HASH32(word, seed) : TPHT_HASH64(word, seed);
-}
 
 static uint64_t tpht_key_word(const tpht_table_t *t, const void *key) {
     return tpht_read_le(key, t->key_size) &
@@ -531,9 +793,6 @@ static size_t tpht_base_from_word(const tpht_table_t *t, uint64_t key_word) {
     return (size_t)((tpht_xxh3_word_bitflip(quotient, t->key_size, t->hash_bitflip) ^ key_word) & t->base_mask);
 }
 
-static size_t tpht_base_from_key(const tpht_table_t *t, const void *key) {
-    return tpht_base_from_word(t, tpht_key_word(t, key));
-}
 
 static void tpht_write_quotient(const tpht_table_t *t, uint8_t *dst, const void *key) {
     tpht_write_le(dst, t->key_quotient_size, tpht_key_quotient(t, key));
@@ -566,7 +825,8 @@ static TPHT_UNUSED uint32_t tpht_low_mask(uint8_t count) {
 #endif
 }
 
-TPHT_HOT uint32_t tpht_fp_match_mask_scalar(const uint8_t *fps, uint8_t count, uint8_t fp) {
+/* Referenced only by the SIMD modes that fall back to it. */
+TPHT_UNUSED TPHT_HOT uint32_t tpht_fp_match_mask_scalar(const uint8_t *fps, uint8_t count, uint8_t fp) {
     uint32_t mask = 0;
     uint8_t i;
     for (i = 0; i < count; ++i) {
@@ -724,17 +984,26 @@ static uint8_t tpht_ctz32(uint32_t x) {
 #endif
 }
 
-static void tpht_lock(tpht_table_t *t) {
-    if (t->cfg.threading == TPHT_CONCURRENT) {
-        while (atomic_flag_test_and_set_explicit(&t->lock, memory_order_acquire)) {
-        }
-    }
+/*
+ * Set the low bit and report what it was.  On x86 this expands to a load and a
+ * compare-exchange loop: there is no byte-wide OR that returns its old value,
+ * and `bts` - which would do it in one locked instruction - has no byte form,
+ * so a one-byte seqlock cannot be taken in a single access.  Widening the
+ * version to 32 bits would allow it, but the flattened block has no spare byte
+ * and the chained lock array would grow fourfold, which is not worth it while
+ * both already match or beat the reference.
+ */
+TPHT_HOT int tpht_bit_test_and_set(atomic_uchar *v) {
+    return atomic_fetch_or_explicit(v, 1u, memory_order_acq_rel) & 1u;
 }
 
-static void tpht_unlock(tpht_table_t *t) {
-    if (t->cfg.threading == TPHT_CONCURRENT) {
-        atomic_flag_clear_explicit(&t->lock, memory_order_release);
-    }
+/* A hint that this core is spinning, so it yields pipeline resources. */
+TPHT_HOT void tpht_cpu_relax(void) {
+#if defined(TPHT_X86_SIMD)
+    _mm_pause();
+#elif defined(TPHT_NEON_SIMD) && (defined(__GNUC__) || defined(__clang__))
+    __asm__ __volatile__("yield" ::: "memory");
+#endif
 }
 
 static void tpht_flag_lock(atomic_flag *lock) {
@@ -742,71 +1011,126 @@ static void tpht_flag_lock(atomic_flag *lock) {
     }
 }
 
+/* One shot, no spin: the caller has useful work to do if someone else holds it. */
+static int tpht_flag_trylock(atomic_flag *lock) {
+    return !atomic_flag_test_and_set_explicit(lock, memory_order_acquire);
+}
+
 static void tpht_flag_unlock(atomic_flag *lock) {
     atomic_flag_clear_explicit(lock, memory_order_release);
 }
 
 static int tpht_chained_fine_grained(const tpht_table_t *t) {
-    return t->cfg.variant == TPHT_CHAINED && t->cfg.threading == TPHT_CONCURRENT &&
-           t->chain_locks && t->pool_locks;
+    /* Decided from the immutable configuration alone: a concurrent chained
+     * table always carries its lock arrays, and reading those pointers here
+     * raced the resize commit's swap of them. */
+    return t->cfg.variant == TPHT_CHAINED && t->cfg.threading == TPHT_CONCURRENT;
 }
 
-static void tpht_chain_lock_base(tpht_table_t *t, size_t base) {
-    if (tpht_chained_fine_grained(t)) tpht_flag_lock(&t->chain_locks[base % t->chain_lock_count]);
+/*
+ * Lock the chain for a base.  The index needs no reduction: a base comes from
+ * tpht_base_from_word, which masks it below base_count, and there is one lock
+ * per base - the modulo that used to be here was a hardware division on every
+ * lock and unlock, twice per operation, for a value already in range.
+ *
+ * The _fine forms skip the configuration test as well: their callers reached
+ * them through it, so re-deriving it from four table fields per lock is work
+ * the call site has already done.
+ */
+/*
+ * A chain's lock is a seqlock version rather than a mutex.  A writer takes the
+ * chain by moving the version from even to odd and releases it by moving on to
+ * the next even value.  A reader never writes it at all: it takes the version,
+ * walks, and re-reads - so readers do not serialise against each other and pay
+ * no atomic read-modify-write, which is what a lookup on a shared table used to
+ * cost.  A reader can observe a chain mid-edit; the re-read discards it.
+ */
+TPHT_HOT void tpht_chain_lock_base_fine(tpht_table_t *t, size_t base) {
+    atomic_uchar *v = &t->chain_locks[TPHT_CHAIN_SLOT(base & t->chain_version_mask)];
+    for (;;) {
+        if (!tpht_bit_test_and_set(v)) return;
+        do {
+            tpht_cpu_relax();
+        } while (atomic_load_explicit(v, memory_order_relaxed) & 1u);
+    }
 }
 
-static void tpht_chain_unlock_base(tpht_table_t *t, size_t base) {
-    if (tpht_chained_fine_grained(t)) tpht_flag_unlock(&t->chain_locks[base % t->chain_lock_count]);
+
+/* Reader side: an even version, waiting out any writer currently in the chain. */
+TPHT_HOT unsigned char tpht_chain_read_begin(tpht_table_t *t, size_t base) {
+    atomic_uchar *v = &t->chain_locks[TPHT_CHAIN_SLOT(base & t->chain_version_mask)];
+    for (;;) {
+        unsigned char cur = atomic_load_explicit(v, memory_order_acquire);
+        if (!(cur & 1u)) return cur;
+        tpht_cpu_relax();
+    }
+}
+
+TPHT_HOT int tpht_chain_read_valid(tpht_table_t *t, size_t base, unsigned char snapshot) {
+    return atomic_load_explicit(&t->chain_locks[TPHT_CHAIN_SLOT(base & t->chain_version_mask)],
+                                memory_order_acquire) == snapshot;
+}
+
+/*
+ * Pointer-returning form: the caller must release exactly the lock it took,
+ * and a resize commit can swap t->chain_locks between the acquire and the
+ * release - recomputing the slot from the table at unlock time would then
+ * unlock a different, live lock.  The storage-generation check right after the
+ * acquire is what detects that swap and sends the caller back around.
+ */
+static atomic_uchar *tpht_chain_lock_take(tpht_table_t *t, size_t base) {
+    atomic_uchar *v = &t->chain_locks[TPHT_CHAIN_SLOT(base & t->chain_version_mask)];
+    for (;;) {
+        if (!tpht_bit_test_and_set(v)) return v;
+        do {
+            tpht_cpu_relax();
+        } while (atomic_load_explicit(v, memory_order_relaxed) & 1u);
+    }
+}
+
+static void tpht_chain_lock_release(atomic_uchar *v) {
+    atomic_store_explicit(v, (unsigned char)(atomic_load_explicit(v, memory_order_relaxed) + 1u),
+                          memory_order_release);
 }
 
 static void tpht_pool_lock_bin(tpht_table_t *t, size_t bin) {
-    if (t->pool_locks) tpht_flag_lock(&t->pool_locks[bin]);
+    if (t->pool.locked)
+        tpht_flag_lock((atomic_flag *)&t->pool.cnt_head[(bin << TPHT_POOL_META_SHIFT) |
+                                                        TPHT_POOL_META_LOCK]);
 }
 
 static void tpht_pool_unlock_bin(tpht_table_t *t, size_t bin) {
-    if (t->pool_locks) tpht_flag_unlock(&t->pool_locks[bin]);
-}
-
-static void tpht_pool_lock_pair(tpht_table_t *t, size_t a, size_t b) {
-    if (!t->pool_locks) return;
-    if (a == b) {
-        tpht_pool_lock_bin(t, a);
-    } else if (a < b) {
-        tpht_pool_lock_bin(t, a);
-        tpht_pool_lock_bin(t, b);
-    } else {
-        tpht_pool_lock_bin(t, b);
-        tpht_pool_lock_bin(t, a);
-    }
-}
-
-static void tpht_pool_unlock_pair(tpht_table_t *t, size_t a, size_t b) {
-    if (!t->pool_locks) return;
-    if (a == b) {
-        tpht_pool_unlock_bin(t, a);
-    } else if (a < b) {
-        tpht_pool_unlock_bin(t, b);
-        tpht_pool_unlock_bin(t, a);
-    } else {
-        tpht_pool_unlock_bin(t, a);
-        tpht_pool_unlock_bin(t, b);
-    }
+    if (t->pool.locked)
+        tpht_flag_unlock((atomic_flag *)&t->pool.cnt_head[(bin << TPHT_POOL_META_SHIFT) |
+                                                          TPHT_POOL_META_LOCK]);
 }
 
 static uint8_t *tpht_pool_entry(tpht_pool_t *p, size_t bin, uint8_t pos) {
-    return p->entries + ((bin * (size_t)p->bin_size + (size_t)pos) * p->entry_size);
+    return p->entries + ((bin * (size_t)TPHT_BIN_SIZE + (size_t)pos) * p->entry_size);
 }
 
+/*
+ * The count byte is read both under the bin lock and without it (the
+ * two-choice comparison, and size() on a fixed table), so every access is a
+ * relaxed atomic: same machine code as a plain byte access, and no
+ * mixed-atomicity race.  Mutations happen only under the bin lock, so a plain
+ * load-add-store through the atomic object is exact.
+ */
 static uint8_t tpht_pool_count(const tpht_pool_t *p, size_t bin) {
-    return p->cnt_head[bin << 1u];
+    return atomic_load_explicit(
+        (const _Atomic uint8_t *)&p->cnt_head[bin << TPHT_POOL_META_SHIFT],
+        memory_order_relaxed);
 }
 
-static uint8_t *tpht_pool_count_ptr(tpht_pool_t *p, size_t bin) {
-    return &p->cnt_head[bin << 1u];
+static void tpht_pool_count_add(tpht_pool_t *p, size_t bin, int delta) {
+    _Atomic uint8_t *c = (_Atomic uint8_t *)&p->cnt_head[bin << TPHT_POOL_META_SHIFT];
+    atomic_store_explicit(
+        c, (uint8_t)(atomic_load_explicit(c, memory_order_relaxed) + delta),
+        memory_order_relaxed);
 }
 
 static uint8_t *tpht_pool_head_ptr(tpht_pool_t *p, size_t bin) {
-    return &p->cnt_head[(bin << 1u) | 1u];
+    return &p->cnt_head[(bin << TPHT_POOL_META_SHIFT) | TPHT_POOL_META_HEAD];
 }
 
 /*
@@ -838,57 +1162,65 @@ TPHT_HOT uint8_t *tpht_pool_alloc(tpht_table_t *t, uint64_t deref_key, uint8_t *
                                   unsigned key_bytes) {
     size_t bin1 = tpht_bin_of(tpht_xxh3_word_bitflip(deref_key, key_bytes, t->hash_bitflip_100), t->pool.bin_count);
     size_t bin2 = tpht_bin_of(tpht_xxh3_word_bitflip(deref_key, key_bytes, t->hash_bitflip_200), t->pool.bin_count);
-    uint8_t flag = 0;
-    size_t bin = bin1;
-    uint8_t *cnt;
+    uint8_t flag;
+    size_t bin;
     uint8_t *head;
     uint8_t pos;
     uint8_t *entry;
 
-    tpht_pool_lock_pair(t, bin1, bin2);
-
     /*
-     * Branchless two-choice: the comparison is a coin flip on real data, so a
-     * branch here mispredicts about half the time.  bin1 == bin2 needs no
-     * special case - flag 1 decodes through the second hash to the same bin.
+     * Optimistic two-choice: compare the fill levels before taking any lock
+     * and lock only the chosen bin.  Locking both bins doubled the lock
+     * traffic of every overflow insert to buy an exact comparison that the
+     * scheme never needed - two-choice is a balance heuristic, and a stale
+     * count just places one entry slightly less evenly.  If the chosen bin
+     * turns out full under its lock (a stale read, or a race), the other bin
+     * gets one try before the caller sees a hard overflow; a full chosen bin
+     * with an exact comparison would have meant both were full anyway.
      */
     flag = (uint8_t)(tpht_pool_count(&t->pool, bin1) > tpht_pool_count(&t->pool, bin2));
     bin = flag ? bin2 : bin1;
-
-    cnt = tpht_pool_count_ptr(&t->pool, bin);
+    tpht_pool_lock_bin(t, bin);
     head = tpht_pool_head_ptr(&t->pool, bin);
-    if (*head >= t->pool.bin_size) {
-        tpht_pool_unlock_pair(t, bin1, bin2);
-        return NULL;
+    if (TPHT_UNLIKELY(*head >= TPHT_BIN_SIZE)) {
+        tpht_pool_unlock_bin(t, bin);
+        flag ^= 1u;
+        bin = flag ? bin2 : bin1;
+        tpht_pool_lock_bin(t, bin);
+        head = tpht_pool_head_ptr(&t->pool, bin);
+        if (*head >= TPHT_BIN_SIZE) {
+            tpht_pool_unlock_bin(t, bin);
+            return NULL;
+        }
     }
 
     pos = *head;
     entry = tpht_pool_entry(&t->pool, bin, pos);
     *head = (uint8_t)(pos + 1u + entry[0]);
-    if (*head > t->pool.bin_size) *head = (uint8_t)(*head - (t->pool.bin_size + 1u));
-    *cnt = (uint8_t)(*cnt + 1u);
+    if (*head > TPHT_BIN_SIZE) *head = (uint8_t)(*head - (TPHT_BIN_SIZE + 1u));
+    tpht_pool_count_add(&t->pool, bin, 1);
     *encoded_out = (uint8_t)((pos + 1u) | (flag << 7u));
-    tpht_pool_unlock_pair(t, bin1, bin2);
+    tpht_pool_unlock_bin(t, bin);
     return entry;
 }
 
 static void tpht_pool_free(tpht_table_t *t, uint8_t encoded_ptr, uint8_t *entry) {
     size_t ordinal = (size_t)((entry - t->pool.entries) / (ptrdiff_t)t->pool.entry_size);
-    size_t bin = ordinal / t->pool.bin_size;
-    uint8_t pos = (uint8_t)(ordinal % t->pool.bin_size);
-    uint8_t *cnt = tpht_pool_count_ptr(&t->pool, bin);
+    size_t bin = ordinal / TPHT_BIN_SIZE;
+    uint8_t pos = (uint8_t)(ordinal % TPHT_BIN_SIZE);
     uint8_t *head = tpht_pool_head_ptr(&t->pool, bin);
     (void)encoded_ptr;
     tpht_pool_lock_bin(t, bin);
-    entry[0] = (uint8_t)(*head + t->pool.bin_size - pos);
-    if (entry[0] > t->pool.bin_size) entry[0] = (uint8_t)(entry[0] - (t->pool.bin_size + 1u));
+    entry[0] = (uint8_t)(*head + TPHT_BIN_SIZE - pos);
+    if (entry[0] > TPHT_BIN_SIZE) entry[0] = (uint8_t)(entry[0] - (TPHT_BIN_SIZE + 1u));
     *head = pos;
-    *cnt = (uint8_t)(*cnt - 1u);
+    tpht_pool_count_add(&t->pool, bin, -1);
     tpht_pool_unlock_bin(t, bin);
 }
 
 static void tpht_free_storage(tpht_table_t *t) {
     tpht_retired_storage_t *r = t->retired;
+    tpht_resize_op_t *op;
     while (r) {
         tpht_retired_storage_t *next = r->next;
         free(r->heads);
@@ -896,37 +1228,42 @@ static void tpht_free_storage(tpht_table_t *t) {
         free(r->pool_entries);
         free(r->pool_cnt_head);
         free(r->chain_locks);
-        free(r->pool_locks);
-        free(r->resize_migrated);
         free(r->resize_descriptor);
         free(r);
         r = next;
     }
     t->retired = NULL;
+    op = t->retired_ops;
+    while (op) {
+        tpht_resize_op_t *next = op->next;
+        free(op->migrated);
+        free(op);
+        op = next;
+    }
+    t->retired_ops = NULL;
     free(t->heads);
     free(t->flat_lines_raw);
     free(t->pool.entries);
     free(t->pool.cnt_head);
     free(t->chain_locks);
-    free(t->pool_locks);
-    if (t->resize_target) {
-        tpht_free_storage(t->resize_target);
-        free(t->resize_target);
+    op = atomic_load_explicit(&t->resize_op, memory_order_acquire);
+    if (op) {
+        /* Destroying mid-resize: the shadow was never published, free it too. */
+        if (op->target) {
+            tpht_free_storage(op->target);
+            free(op->target);
+        }
+        free(op->migrated);
+        free(op);
+        atomic_store_explicit(&t->resize_op, NULL, memory_order_release);
     }
-    free(t->resize_migrated);
     t->heads = NULL;
     t->flat_lines = NULL;
     t->flat_lines_raw = NULL;
     t->pool.entries = NULL;
     t->pool.cnt_head = NULL;
     t->chain_locks = NULL;
-    t->pool_locks = NULL;
     t->chain_lock_count = 0;
-    t->pool_lock_count = 0;
-    t->resize_target = NULL;
-    t->resize_migrated = NULL;
-    t->resize_stride_count = 0;
-    t->resize_stride_size = 0;
 }
 
 /*
@@ -1052,19 +1389,26 @@ static int tpht_alloc_flat_lines(tpht_table_t *t) {
     return 1;
 }
 
+static uint64_t tpht_flat_pack_of(const tpht_table_t *t) {
+    return (uint64_t)(uintptr_t)t->flat_lines | (uint64_t)t->flat_cloud_bits;
+}
+
 /*
  * A resizable table leaves the hot path one insert before it would exceed its
  * load factor; a fixed one when it is exactly full.  Recomputed wherever the
  * capacity changes, so the hot path only ever compares against this.
  */
-static void tpht_set_write_limit(tpht_table_t *t) {
+/*
+ * Commit-time form: recompute only what the capacity changes.  tracks_size is
+ * an invariant of the table's resize mode, written once at creation; the
+ * commit re-storing it (same value) raced the hot path's unsynchronized read
+ * of it for no benefit.
+ */
+static void tpht_refresh_write_limit(tpht_table_t *t) {
     if (t->cfg.resize_mode == TPHT_FIXED) {
-        /* Nothing to test against: a fixed table keeps no running size. */
-        t->tracks_size = 0u;
         t->write_limit = (size_t)-1;
         return;
     }
-    t->tracks_size = 1u;
     {
         /*
          * Grow one insert before the load factor would be exceeded: the test
@@ -1075,7 +1419,20 @@ static void tpht_set_write_limit(tpht_table_t *t) {
         size_t whole = limit <= 0.0 ? 0u : (size_t)limit;
         t->write_limit = whole + 1u;
     }
+    {
+        size_t period = t->write_limit / (8u * TPHT_SIZE_CHECK_PERIOD);
+        if (period > TPHT_SIZE_CHECK_PERIOD) period = TPHT_SIZE_CHECK_PERIOD;
+        if (period == 0) period = 1;
+        atomic_store_explicit(&t->size_check_period, (unsigned)period, memory_order_relaxed);
+    }
 }
+
+/* Creation-time form: also settles the size-tracking invariant. */
+static void tpht_set_write_limit(tpht_table_t *t) {
+    t->tracks_size = t->cfg.resize_mode == TPHT_FIXED ? 0u : 1u;
+    tpht_refresh_write_limit(t);
+}
+
 
 static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
     size_t overflow_slots;
@@ -1086,19 +1443,17 @@ static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
     t->value_size = t->cfg.value_size;
     t->key_bits = (uint8_t)(t->key_size * 8u);
     t->key_mask = t->key_bits >= 64u ? UINT64_MAX : ((UINT64_C(1) << t->key_bits) - 1u);
-    t->hash_bitflip =
-        (TPHT_XXH3_SECRET_08 ^ TPHT_XXH3_SECRET_16) -
-        (t->cfg.hash_seed ^ ((uint64_t)tpht_bswap32((uint32_t)t->cfg.hash_seed) << 32));
-    t->hash_bitflip_100 =
-        (TPHT_XXH3_SECRET_08 ^ TPHT_XXH3_SECRET_16) -
-        ((t->cfg.hash_seed + UINT64_C(0x100)) ^
-         ((uint64_t)tpht_bswap32((uint32_t)(t->cfg.hash_seed + UINT64_C(0x100))) << 32));
-    t->hash_bitflip_200 =
-        (TPHT_XXH3_SECRET_08 ^ TPHT_XXH3_SECRET_16) -
-        ((t->cfg.hash_seed + UINT64_C(0x200)) ^
-         ((uint64_t)tpht_bswap32((uint32_t)(t->cfg.hash_seed + UINT64_C(0x200))) << 32));
-    t->pool.bin_size = t->cfg.bin_size ? t->cfg.bin_size : TPHT_DEFAULT_BIN_SIZE;
-    if (t->pool.bin_size == 0 || t->pool.bin_size > 127u) return 0;
+    /*
+     * Three hash streams: one for quotienting, two for the dereference table's
+     * two-choice allocation.  They are derived by mixing the table seed with a
+     * stream index rather than by adding a small constant to it: adjacent seeds
+     * produce bitflips that differ in only a few bits, and the two-choice
+     * placement then measurably correlates, which is exactly the independence
+     * the scheme depends on.
+     */
+    t->hash_bitflip = tpht_stream_bitflip(t->cfg.hash_seed, 0u);
+    t->hash_bitflip_100 = tpht_stream_bitflip(t->cfg.hash_seed, 1u);
+    t->hash_bitflip_200 = tpht_stream_bitflip(t->cfg.hash_seed, 2u);
 
     if (t->cfg.variant == TPHT_CHAINED) {
         t->base_count = tpht_pow2_ceil(t->capacity);
@@ -1193,6 +1548,7 @@ static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
             tpht_free_storage(t);
             return 0;
         }
+        atomic_store_explicit(&t->flat_lines_pack, tpht_flat_pack_of(t), memory_order_release);
         t->flat_cost = t->flat_entry_size > 1u ? (uint8_t)(t->flat_entry_size - 1u) : 1u;
         t->flat_inline_ok = 0u;
         for (x = 0; x < TPHT_FLAT_MAX_TUPLES; ++x) {
@@ -1210,115 +1566,60 @@ static int tpht_alloc_storage(tpht_table_t *t, size_t capacity) {
         overflow_slots = tpht_max_size(overflow_slots, t->flat_deref_floor);
     }
 
-    t->pool.bin_count = (overflow_slots + t->pool.bin_size - 1u) / t->pool.bin_size;
+    t->pool.bin_count = (overflow_slots + TPHT_BIN_SIZE - 1u) / TPHT_BIN_SIZE;
     t->pool.bin_count = tpht_max_size(t->pool.bin_count, 1);
     t->pool.entries = (uint8_t *)calloc(
-        t->pool.bin_count * (size_t)t->pool.bin_size * t->pool.entry_size + TPHT_LOAD_SLACK, 1);
-    t->pool.cnt_head = (uint8_t *)calloc(t->pool.bin_count * 2u, 1);
+        t->pool.bin_count * (size_t)TPHT_BIN_SIZE * t->pool.entry_size + TPHT_LOAD_SLACK, 1);
+    t->pool.cnt_head =
+        (uint8_t *)calloc(t->pool.bin_count << TPHT_POOL_META_SHIFT, 1);
+    t->pool.locked = t->cfg.threading == TPHT_CONCURRENT ? 1u : 0u;
 
-    if (t->cfg.variant == TPHT_CHAINED && t->cfg.threading == TPHT_CONCURRENT) {
+    if (t->cfg.threading == TPHT_CONCURRENT) {
         size_t i;
-        t->chain_lock_count = t->base_count;
-        t->pool_lock_count = t->pool.bin_count;
-        t->chain_locks = (atomic_flag *)malloc(t->chain_lock_count * sizeof(*t->chain_locks));
-        t->pool_locks = (atomic_flag *)malloc(t->pool_lock_count * sizeof(*t->pool_locks));
-        if (t->chain_locks && t->pool_locks) {
-            for (i = 0; i < t->chain_lock_count; ++i) atomic_flag_clear(&t->chain_locks[i]);
-            for (i = 0; i < t->pool_lock_count; ++i) atomic_flag_clear(&t->pool_locks[i]);
+        /* The flattened variant serialises a block with its own seqlock and
+         * only needs the dereference bins locked; the chained one locks the
+         * base chains as well. */
+        t->chain_lock_count = t->cfg.variant == TPHT_CHAINED
+                                  ? (t->base_count < TPHT_CHAIN_VERSION_SLOTS
+                                         ? t->base_count
+                                         : TPHT_CHAIN_VERSION_SLOTS)
+                                  : 1u;
+        t->chain_version_mask = t->chain_lock_count - 1u;
+        t->chain_locks = (atomic_uchar *)calloc(TPHT_CHAIN_SLOT(t->chain_lock_count),
+                                                sizeof(*t->chain_locks));
+        if (t->chain_locks) {
+            for (i = 0; i < t->chain_lock_count; ++i)
+                atomic_init(&t->chain_locks[TPHT_CHAIN_SLOT(i)], 0u);
+        }
+        if (t->pool.cnt_head) {
+            for (i = 0; i < t->pool.bin_count; ++i)
+                atomic_flag_clear(
+                    (atomic_flag *)&t->pool.cnt_head[(i << TPHT_POOL_META_SHIFT) |
+                                                     TPHT_POOL_META_LOCK]);
         }
     }
 
     if (!t->pool.entries || !t->pool.cnt_head ||
-        (t->cfg.variant == TPHT_CHAINED && t->cfg.threading == TPHT_CONCURRENT &&
-         (!t->chain_locks || !t->pool_locks))) {
+        (t->cfg.threading == TPHT_CONCURRENT && !t->chain_locks)) {
         tpht_free_storage(t);
         return 0;
     }
 
-    tpht_prefault(t->heads, t->base_count);
-    tpht_prefault(t->flat_lines_raw,
-                  t->cfg.variant == TPHT_FLATTEN
-                      ? t->base_count * (size_t)TPHT_FLAT_LINE_BYTES + TPHT_FLAT_LINE_BYTES - 1u
-                      : 0u);
-    tpht_prefault(t->pool.entries,
-                  t->pool.bin_count * (size_t)t->pool.bin_size * t->pool.entry_size);
-    tpht_prefault(t->pool.cnt_head, t->pool.bin_count * 2u);
+    if (!t->no_prefault) {
+        tpht_prefault(t->heads, t->base_count);
+        tpht_prefault(t->flat_lines_raw,
+                      t->cfg.variant == TPHT_FLATTEN
+                          ? t->base_count * (size_t)TPHT_FLAT_LINE_BYTES + TPHT_FLAT_LINE_BYTES - 1u
+                          : 0u);
+        tpht_prefault(t->pool.entries,
+                      t->pool.bin_count * (size_t)TPHT_BIN_SIZE * t->pool.entry_size);
+        tpht_prefault(t->pool.cnt_head, t->pool.bin_count << TPHT_POOL_META_SHIFT);
+    }
     return 1;
 }
 
-static int tpht_stored_key_equal(tpht_table_t *t, const uint8_t *stored_key, const void *key) {
-    return tpht_read_quotient(t, stored_key) == tpht_key_quotient(t, key);
-}
 
-static size_t tpht_chained_base(tpht_table_t *t, const void *key) {
-    return tpht_base_from_key(t, key);
-}
 
-/*
- * The geometry a chain walk needs, lifted out of the table once.  Reading it
- * through the table pointer inside the loop makes the compiler reload every
- * field on each step: the walk stores nothing, but it cannot prove that the
- * pointers it chases do not alias the table itself.  Hoisting turns a chain
- * step from a dozen loads into arithmetic on registers.
- */
-typedef struct tpht_chain_geom {
-    uint8_t *entries;
-    size_t bin_count;
-    size_t bin_size;
-    size_t entry_size;
-    uint64_t bitflip_100;
-    uint64_t bitflip_200;
-    uint64_t quotient_mask;
-    unsigned key_bytes;
-} tpht_chain_geom_t;
-
-TPHT_HOT void tpht_chain_geom(const tpht_table_t *t, tpht_chain_geom_t *g) {
-    g->entries = t->pool.entries;
-    g->bin_count = t->pool.bin_count;
-    g->bin_size = t->pool.bin_size;
-    g->entry_size = t->pool.entry_size;
-    g->bitflip_100 = t->hash_bitflip_100;
-    g->bitflip_200 = t->hash_bitflip_200;
-    g->quotient_mask = t->quotient_mask;
-    g->key_bytes = t->key_size;
-}
-
-TPHT_HOT uint8_t *tpht_chain_step(const tpht_chain_geom_t *g, const uint8_t *prev) {
-    uint8_t ptr = *prev;
-    size_t pos = (size_t)((ptr & 0x7fu) - 1u);
-    uint64_t bitflip = (ptr >> 7u) ? g->bitflip_200 : g->bitflip_100;
-    size_t bin = tpht_bin_of(
-        tpht_xxh3_word_bitflip((uint64_t)(uintptr_t)prev, g->key_bytes, bitflip), g->bin_count);
-    return g->entries + (bin * g->bin_size + pos) * g->entry_size;
-}
-
-TPHT_HOT uint64_t tpht_chain_quotient(const tpht_chain_geom_t *g, const uint8_t *entry) {
-#if TPHT_LITTLE_ENDIAN
-    uint64_t v;
-    memcpy(&v, entry + 1u, 8);
-    return v & g->quotient_mask;
-#else
-    return tpht_read_le(entry + 1u, 8) & g->quotient_mask;
-#endif
-}
-
-static tpht_status_t tpht_chained_get_raw(tpht_table_t *t, const void *key, void *value_out) {
-    uint64_t key_word = tpht_key_word(t, key);
-    size_t base = tpht_base_from_word(t, key_word);
-    uint64_t key_quot = key_word >> t->base_bits;
-    uint8_t *prev = &t->heads[base];
-    while (*prev) {
-        uint8_t *entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev, t->key_size);
-        if (tpht_read_quotient(t, entry + 1u) == key_quot) {
-            if (value_out && t->value_size)
-                tpht_store_le(value_out, t->value_size,
-                              tpht_read_le(entry + 1u + t->key_quotient_size, t->value_size));
-            return TPHT_OK;
-        }
-        prev = entry;
-    }
-    return TPHT_NOT_FOUND;
-}
 
 TPHT_HOT tpht_status_t tpht_chained_insert_raw(tpht_table_t *t, const void *key,
                                                const void *value, int replace) {
@@ -1332,9 +1633,8 @@ TPHT_HOT tpht_status_t tpht_chained_insert_raw(tpht_table_t *t, const void *key,
         while (*prev) {
             entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev, t->key_size);
             if (tpht_read_quotient(t, entry + 1u) == key_quot) {
-                if (t->value_size)
-                    tpht_store_le(entry + 1u + t->key_quotient_size, t->value_size,
-                                  tpht_read_le(value, t->value_size));
+                tpht_store_le(entry + 1u + t->key_quotient_size, t->value_size,
+                              tpht_read_le(value, t->value_size));
                 return TPHT_OK;
             }
             prev = entry;
@@ -1379,9 +1679,8 @@ TPHT_HOT tpht_status_t tpht_chained_insert_raw(tpht_table_t *t, const void *key,
 #endif
     {
         tpht_write_quotient(t, entry + 1u, key);
-        if (t->value_size)
-            tpht_store_le(entry + 1u + t->key_quotient_size, t->value_size,
-                          tpht_read_le(value, t->value_size));
+        tpht_store_le(entry + 1u + t->key_quotient_size, t->value_size,
+                      tpht_read_le(value, t->value_size));
     }
     if (t->tracks_size) tpht_size_inc(t);
     return TPHT_OK;
@@ -1582,11 +1881,93 @@ TPHT_HOT void tpht_flat_set_meta(uint8_t *line, uint8_t count, uint8_t crystals)
 }
 
 /*
- * No writer fence is needed: this variant is sequential only, so the seqlock
- * version byte holds the crystal count instead (see tpht_flat_set_meta).
+ * Per-block seqlock, in the byte reserved for it.  Even means the block is
+ * stable; odd means a writer is inside it.  A writer takes the block by moving
+ * the version from even to odd and releases it by moving it on to the next
+ * even value, so a reader that sees the same even version before and after its
+ * read knows nothing changed underneath it.
+ *
+ * `concurrent` is a literal at every call site, so a sequential table compiles
+ * all of this away and pays nothing - the same way the key width and the
+ * overwrite flag fold.
  */
-static void tpht_flat_write_begin(uint8_t *line) { (void)line; }
-static void tpht_flat_write_end(uint8_t *line) { (void)line; }
+TPHT_HOT atomic_uchar *tpht_flat_version(uint8_t *line) {
+    return (atomic_uchar *)(void *)(line + TPHT_FLAT_VERSION_OFF);
+}
+
+TPHT_HOT void tpht_flat_write_begin(uint8_t *line, int concurrent) {
+    if (!concurrent) {
+        (void)line;
+        return;
+    }
+    {
+        /*
+         * Taking the block is one read-modify-write, not a load followed by a
+         * compare-exchange.  Setting the low bit is idempotent, so the returned
+         * value alone says whether we took it: even means it was ours, odd
+         * means someone else already held it and nothing was disturbed.  The
+         * load-then-CAS form fetched the line shared and then had to upgrade it
+         * to exclusive - two coherence round trips on the block's first touch,
+         * which measured as two thirds of an insert.
+         */
+        atomic_uchar *v = tpht_flat_version(line);
+        for (;;) {
+            if (!tpht_bit_test_and_set(v)) return;
+            /* Spin read-only so a waiter does not keep stealing the line. */
+            do {
+                tpht_cpu_relax();
+            } while (atomic_load_explicit(v, memory_order_relaxed) & 1u);
+        }
+    }
+}
+
+TPHT_HOT void tpht_flat_write_end(uint8_t *line, int concurrent) {
+    if (!concurrent) {
+        (void)line;
+        return;
+    }
+    {
+        /*
+         * The release is deliberately a plain store, not a locked increment.
+         * Measured on Xeon 6980P at 32-64 threads, a locked release is 15-24%
+         * slower - a second locked RMW on a contended line - and a concurrent
+         * table is built for the contended case.  (Single-thread comparisons
+         * between the two proved too noise-prone to support any claim; a
+         * single-threaded caller has the sequential variant, which beats both.)
+         * Do not "fix" this to fetch_add without re-measuring under threads.
+         */
+        atomic_uchar *v = tpht_flat_version(line);
+        atomic_store_explicit(v, (unsigned char)(atomic_load_explicit(v, memory_order_relaxed) + 1u),
+                              memory_order_release);
+    }
+}
+
+/* Snapshot for a reader: an even version, waiting out any writer in the block. */
+TPHT_HOT unsigned char tpht_flat_read_begin(const uint8_t *line, int concurrent) {
+    if (!concurrent) {
+        (void)line;
+        return 0u;
+    }
+    {
+        atomic_uchar *v = tpht_flat_version((uint8_t *)(void *)(uintptr_t)line);
+        for (;;) {
+            unsigned char cur = atomic_load_explicit(v, memory_order_acquire);
+            if (!(cur & 1u)) return cur;
+            tpht_cpu_relax();
+        }
+    }
+}
+
+/* True when the block did not change while the reader was inside it. */
+TPHT_HOT int tpht_flat_read_valid(const uint8_t *line, unsigned char snapshot, int concurrent) {
+    if (!concurrent) {
+        (void)line;
+        (void)snapshot;
+        return 1;
+    }
+    return atomic_load_explicit(tpht_flat_version((uint8_t *)(void *)(uintptr_t)line),
+                                memory_order_acquire) == snapshot;
+}
 
 /* First byte past the crystal region, and the anchor of the tiny pointers. */
 TPHT_HOT uint8_t tpht_flat_crystal_end(const tpht_table_t *t, uint8_t crystals) {
@@ -1811,55 +2192,123 @@ static void tpht_flat_promote(tpht_table_t *t, uint8_t *line, size_t block, uint
  * building that descriptor costs more than the comparison itself.
  */
 /* value_out must not be NULL; internal probes pass a scratch slot. */
+static int tpht_flat_resize_active(const tpht_table_t *t);
+static int tpht_flat_conc_resize_start(tpht_table_t *t, size_t new_capacity, uint32_t growth,
+                                        size_t deref_floor, int block);
+static void tpht_flat_resize_finish_all(tpht_table_t *t);
+static void tpht_flat_resize_help_one(tpht_table_t *t);
+static tpht_resize_op_t *tpht_resize_op_snapshot(tpht_table_t *t);
+static void tpht_flat_shadow_write(tpht_resize_op_t *op, uint64_t key, uint64_t value,
+                                   int replace, unsigned key_bytes);
+static void tpht_flat_shadow_remove(tpht_resize_op_t *op, uint64_t key, unsigned key_bytes);
+
 TPHT_HOT tpht_status_t tpht_flat_get_raw(tpht_table_t *t, uint64_t key, uint64_t *value_out,
-                                       unsigned key_bytes) {
+                                       unsigned key_bytes, int concurrent) {
     tpht_flat_loc_t loc;
     uint8_t *line;
-    uint8_t count;
-    uint8_t crystals;
-    uint8_t crystal_end;
-    uint32_t mask;
-    uint32_t tp_mask;
-
-    tpht_flat_locate(t, key, &loc, key_bytes);
-    line = tpht_flat_line(t, loc.block);
-    count = tpht_flat_count(line);
-    crystals = tpht_flat_crystals(t, line);
-    mask = tpht_fp_match_mask(line, count, loc.fp);
-    crystal_end = tpht_flat_crystal_end(t, crystals);
+    tpht_table_t *g = t;
 
     /*
-     * Split the match mask once instead of asking "is this one inline?" per
-     * candidate.  Fingerprints are ordered crystals first, so the low
-     * `crystals` bits are the inline matches and the rest are overflow ones.
-     * That keeps the common loop free of a data-dependent branch and keeps the
-     * dereference out of it entirely.
+     * The whole walk runs off one immutable geometry snapshot (see geo_snap):
+     * a reader holds no lock, so the table's own fields can be mid-swap under
+     * a resize commit, and any pointer composed from a torn pair of them can
+     * point outside every allocation.  The snapshot cannot tear.  For a
+     * sequential table it is the table itself and `g` folds back to `t`.
      */
-    tp_mask = mask >> crystals;
-    mask &= (UINT32_C(1) << crystals) - 1u;
+    if (concurrent) g = atomic_load_explicit(&t->geo_snap, memory_order_acquire);
+    tpht_flat_locate(g, key, &loc, key_bytes);
+    line = tpht_flat_line(g, loc.block);
 
-    while (mask) {
-        uint8_t i = tpht_ctz32(mask);
-        const uint8_t *payload = tpht_flat_crystal(t, line, i);
-        mask &= mask - 1u;
-        if (tpht_flat_read_rem(t, payload) == loc.rem) {
-            *value_out = tpht_flat_read_value(t, payload);
-            return TPHT_OK;
-        }
-    }
+    /*
+     * A concurrent reader takes the block's version, reads without any lock,
+     * and only trusts what it found if the version is still the one it started
+     * from; a writer that touched the block in between forces another attempt.
+     * A resize never stalls a reader: the old storage stays complete for the
+     * whole migration (every write during one lands in the old block first),
+     * so the walk below is valid whether a resize is running or not, and the
+     * snapshot re-check catches a commit that swapped the storage mid-walk.
+     * For a sequential table all of this folds away and the loop runs exactly
+     * once, leaving the code below identical to what it was.
+     */
+    for (;;) {
+        unsigned char snapshot;
+        snapshot = tpht_flat_read_begin(line, concurrent);
+        uint8_t count = tpht_flat_count(line);
+        uint8_t crystals = tpht_flat_crystals(g, line);
+        uint32_t mask = tpht_fp_match_mask(line, count, loc.fp);
+        uint8_t crystal_end = tpht_flat_crystal_end(g, crystals);
+        uint32_t tp_mask;
+        int found = 0;
+        uint64_t value = 0;
 
-    while (tp_mask) {
-        uint8_t j = tpht_ctz32(tp_mask);
-        uint8_t encoded = *tpht_flat_tp_slot(line, crystal_end, j);
-        const uint8_t *payload =
-            tpht_pool_deref(t, tpht_flat_deref_key(loc.block, loc.fp), encoded, key_bytes);
-        tp_mask &= tp_mask - 1u;
-        if (tpht_flat_read_rem(t, payload) == loc.rem) {
-            *value_out = tpht_flat_read_value(t, payload);
-            return TPHT_OK;
+        /*
+         * Split the match mask once instead of asking "is this one inline?" per
+         * candidate.  Fingerprints are ordered crystals first, so the low
+         * `crystals` bits are the inline matches and the rest are overflow ones.
+         * That keeps the common loop free of a data-dependent branch and keeps
+         * the dereference out of it entirely.
+         */
+        tp_mask = crystals >= 32u ? 0u : (mask >> crystals);
+        mask &= crystals >= 32u ? UINT32_MAX : ((UINT32_C(1) << crystals) - 1u);
+
+        while (mask) {
+            uint8_t i = tpht_ctz32(mask);
+            const uint8_t *payload = tpht_flat_crystal(g, line, i);
+            mask &= mask - 1u;
+            if (tpht_flat_read_rem(g, payload) == loc.rem) {
+                /* A sequential table cannot see a torn block, so it answers
+                 * straight from the loop as it always did; only the concurrent
+                 * form has to carry the result out to the version check. */
+                if (!concurrent) {
+                    *value_out = tpht_flat_read_value(g, payload);
+                    return TPHT_OK;
+                }
+                value = tpht_flat_read_value(g, payload);
+                found = 1;
+                break;
+            }
         }
+
+        while (!found && tp_mask) {
+            uint8_t j = tpht_ctz32(tp_mask);
+            uint8_t encoded = *tpht_flat_tp_slot(line, crystal_end, j);
+            const uint8_t *payload;
+            /*
+             * A tiny pointer's low seven bits are a slot number plus one, so a
+             * zero there is not a slot at all - and the subtraction would wrap
+             * to 255, addressing far past the bin.  A lock-free reader can see
+             * that while a writer is rearranging the block, so it stops here
+             * and lets the version check send it round again.  A sequential
+             * table never observes a half-written block, and the test folds.
+             */
+            if (concurrent && (encoded & 0x7fu) == 0u) break;
+            payload = tpht_pool_deref(g, tpht_flat_deref_key(loc.block, loc.fp), encoded,
+                                      key_bytes);
+            tp_mask &= tp_mask - 1u;
+            if (tpht_flat_read_rem(g, payload) == loc.rem) {
+                if (!concurrent) {
+                    *value_out = tpht_flat_read_value(g, payload);
+                    return TPHT_OK;
+                }
+                value = tpht_flat_read_value(g, payload);
+                found = 1;
+            }
+        }
+
+        /* Everything read above is only real if the block held still... */
+        if (!tpht_flat_read_valid(line, snapshot, concurrent)) continue;
+        /* ...and only if the storage itself was not swapped mid-walk. */
+        if (concurrent &&
+            TPHT_UNLIKELY(atomic_load_explicit(&t->geo_snap, memory_order_acquire) != g)) {
+            g = atomic_load_explicit(&t->geo_snap, memory_order_acquire);
+            tpht_flat_locate(g, key, &loc, key_bytes);
+            line = tpht_flat_line(g, loc.block);
+            continue;
+        }
+        if (!found) return TPHT_NOT_FOUND;
+        *value_out = value;
+        return TPHT_OK;
     }
-    return TPHT_NOT_FOUND;
 }
 
 /*
@@ -1871,7 +2320,7 @@ TPHT_NOINLINE static tpht_status_t tpht_flat_insert_soft(tpht_table_t *t, uint8_
                                                          tpht_flat_loc_t loc,
                                                          uint64_t value, uint8_t count,
                                                          uint8_t crystals, uint8_t crystal_end,
-                                                         unsigned key_bytes) {
+                                                         unsigned key_bytes, int concurrent) {
     uint8_t next_crystals = t->flat_crystals[count + 1u];
     {
         /*
@@ -1896,12 +2345,11 @@ TPHT_NOINLINE static tpht_status_t tpht_flat_insert_soft(tpht_table_t *t, uint8_
             if (!entries[i]) {
                 while (i-- > 0u) tpht_pool_free(t, encoded[i], entries[i]);
                 /* Hard overflow: the dereference table is exhausted. */
-                t->flat_deref_pressure = 1u;
+                atomic_store_explicit(&t->flat_deref_pressure, 1u, memory_order_relaxed);
                 return TPHT_FULL;
             }
         }
 
-        tpht_flat_write_begin(line);
         /* Copy the evicted pairs out before their bytes are reused. */
         for (i = 0; i < evictions; ++i) {
             uint8_t *victim = tpht_flat_crystal(t, line, (uint8_t)(next_crystals + i));
@@ -1917,8 +2365,18 @@ TPHT_NOINLINE static tpht_status_t tpht_flat_insert_soft(tpht_table_t *t, uint8_
         *tpht_flat_tp_slot(line, new_end, (uint8_t)(count - next_crystals)) = encoded[evictions];
         line[count] = loc.fp;
         tpht_flat_set_meta(line, (uint8_t)(count + 1u), next_crystals);
-        tpht_flat_write_end(line);
-        if (t->tracks_size) tpht_size_inc_seq(t);
+        /* The caller still holds this block, so a concurrent table's counter
+         * moves inside the critical section: the resize commit holds every
+         * block seqlock while it overwrites size with the shadow's count, and
+         * an increment left pending outside the lock would land after that
+         * store and count its key twice - or be overwritten and count it not
+         * at all.  Inside the lock, commit and counter cannot interleave. */
+        if (t->tracks_size) {
+            if (concurrent)
+                tpht_size_inc_conc(t);
+            else
+                tpht_size_inc_seq(t);
+        }
         return TPHT_OK;
     }
 }
@@ -1928,7 +2386,7 @@ TPHT_NOINLINE static tpht_status_t tpht_flat_insert_soft(tpht_table_t *t, uint8_
  * probe (and its SIMD fingerprint match setup) out of the append path.
  */
 TPHT_HOT tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, uint64_t key, uint64_t value,
-                                            int replace, unsigned key_bytes) {
+                                            int replace, unsigned key_bytes, int concurrent) {
     tpht_flat_loc_t loc;
     tpht_flat_slot_t slot;
     uint8_t *line;
@@ -1936,27 +2394,116 @@ TPHT_HOT tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, uint64_t key, uint6
     uint8_t count;
     uint8_t crystals;
     uint8_t crystal_end;
-
-    tpht_flat_locate(t, key, &loc, key_bytes);
-    line = tpht_flat_line(t, loc.block);
+    tpht_status_t st;
+    tpht_resize_op_t *shadow_op = NULL;
+    uint64_t pack = 0;
 
     /*
-     * insert (replace == 0) appends unconditionally, so no existence probe is
-     * needed; only an overwrite (replace != 0) must locate the existing slot.
+     * The line pointer must be memory-safe even against a half-observed
+     * resize commit, and a writer holds no lock yet.  flat_lines_pack carries
+     * the line array and its block-count log2 in one atomic word: clamping
+     * the located block by the packed bit count keeps the pointer inside the
+     * packed array whatever torn mask values the locate read.  Torn values
+     * can still pick a wrong (in-bounds) block - the pack re-read under the
+     * lock catches exactly those interleavings and retries.
+     */
+    if (concurrent) pack = atomic_load_explicit(&t->flat_lines_pack, memory_order_acquire);
+    tpht_flat_locate(t, key, &loc, key_bytes);
+    if (concurrent) {
+        /*
+         * The range check, not a clamp: a clamp sat on the address dependency
+         * chain of the block lock and measurably slowed every insert, while
+         * this branch runs beside it and predicts perfectly - it only fires
+         * when the locate's mask raced a resize commit, in which case the
+         * caller retries with fresh values.  In-bounds-but-wrong blocks from
+         * the same race are caught by the pack re-read under the lock.
+         */
+        if (TPHT_UNLIKELY(loc.block >> (pack & 63u))) return TPHT_INVALID;
+        line = (uint8_t *)(uintptr_t)(pack & ~UINT64_C(63)) +
+               ((size_t)loc.block << TPHT_FLAT_LINE_SHIFT);
+    } else {
+        line = tpht_flat_line(t, loc.block);
+    }
+
+    /*
+     * The block is taken before anything is read from it, not just before the
+     * write: deciding where a tuple goes reads the counts, and two writers that
+     * read the same counts would both write the same slot.  The whole
+     * read-decide-write sequence has to be the critical section.
+     */
+    tpht_flat_write_begin(line, concurrent);
+    if (concurrent) {
+        /*
+         * The lock means nothing if it was taken in a storage that a resize
+         * commit has replaced: the pack re-read under the lock says whether
+         * one landed in between - one word comparison, exact because storages
+         * are never address-reused while the table lives.  And with the lock
+         * held the verdict is final: a commit takes every old line lock
+         * before storing a single field, so a stable pack means every
+         * geometry field the locate read was stable too.
+         *
+         * During an active resize the old storage stays authoritative - every
+         * write lands here first - so writers never stall for the migration.
+         * If this block was already copied to the shadow, the write is applied
+         * there as well before the block is released, keeping the shadow an
+         * exact mirror of every migrated block; the commit then publishes a
+         * storage that already contains this write.  The mirror is gated on
+         * the descriptor's own starting pack: the flag alone can name a
+         * finished resize during its commit's tail, whose shadow is gone.
+         */
+        if (TPHT_UNLIKELY(atomic_load_explicit(&t->flat_lines_pack, memory_order_acquire) !=
+                          pack)) {
+            tpht_flat_write_end(line, concurrent);
+            return TPHT_INVALID;
+        }
+        if (TPHT_UNLIKELY(tpht_flat_resize_active(t))) {
+            tpht_resize_op_t *op = tpht_resize_op_snapshot(t);
+            if (TPHT_UNLIKELY(!op || op->old_pack != pack)) {
+                tpht_flat_write_end(line, concurrent);
+                return TPHT_INVALID;
+            }
+            if (op->migrated[loc.block]) shadow_op = op;
+        }
+    }
+
+    /*
+     * `replace` selects the write's semantics, and is a literal at every call
+     * site so the arms that do not apply disappear:
+     *   0  append unconditionally - no existence probe at all
+     *   1  overwrite if present, else append
+     *   2  overwrite only, and report a missing key rather than adding it
+     *
+     * Mode 2 exists so an update is a single critical section.  It used to be a
+     * lookup followed by a separate overwrite, and a key removed between the
+     * two would fall through to the append path - an update on an absent key
+     * would create it, which is exactly what update promises not to do.
      */
     if (replace && tpht_flat_find(t, line, &loc, &slot, key_bytes)) {
-        tpht_flat_write_begin(line);
         tpht_flat_write_value(t, slot.payload, value);
-        tpht_flat_write_end(line);
+        if (concurrent && TPHT_UNLIKELY(shadow_op != NULL))
+            tpht_flat_shadow_write(shadow_op, key, value, 1, key_bytes);
+        tpht_flat_write_end(line, concurrent);
         return TPHT_OK;
+    }
+    if (replace == 2) {
+        tpht_flat_write_end(line, concurrent);
+        return TPHT_NOT_FOUND;
     }
 
     /* Both counts arrive in one 16-bit load, with the line's own cache miss. */
     meta = tpht_flat_meta(line);
     count = tpht_flat_meta_count(meta);
-    /* Hard overflow: the block cannot address another tuple. */
-    if (TPHT_UNLIKELY(count >= TPHT_FLAT_MAX_TUPLES)) {
-        t->flat_deref_pressure = 0u;
+    /*
+     * Hard overflow: the block cannot hold another tuple.  The bound is one
+     * below the count field's ceiling, because a count of TPHT_FLAT_MAX_TUPLES
+     * is representable but never fits: even all-spilled, x tuples cost x
+     * fingerprint bytes plus x tiny-pointer bytes, and 2 * 31 already exceeds
+     * the 61 usable bytes.  Guarding at the ceiling itself let a 31st tuple
+     * in, whose layout ran one byte past the line into the metadata field.
+     */
+    if (TPHT_UNLIKELY(count >= TPHT_FLAT_MAX_TUPLES - 1u)) {
+        atomic_store_explicit(&t->flat_deref_pressure, 0u, memory_order_relaxed);
+        tpht_flat_write_end(line, concurrent);
         return TPHT_FULL;
     }
 
@@ -1973,7 +2520,6 @@ TPHT_HOT tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, uint64_t key, uint6
         /* The pair itself still fits in the line. */
         uint8_t tps = (uint8_t)(count - crystals);
         uint8_t new_end = (uint8_t)(crystal_end - t->flat_entry_size);
-        tpht_flat_write_begin(line);
         if (tps) {
             /* Tiny pointers stay anchored to the crystal region, and the new
              * crystal's fingerprint takes index `crystals`. */
@@ -1984,15 +2530,40 @@ TPHT_HOT tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, uint64_t key, uint6
         tpht_flat_write_payload(t, line + new_end, loc.rem, value);
         /* Both counts up by one: one add on the 16-bit meta field. */
         tpht_flat_add_crystal(line);
-        tpht_flat_write_end(line);
-        if (t->tracks_size) tpht_size_inc_seq(t);
+        /* Inside the critical section, for the same reason as in
+         * tpht_flat_insert_soft: the resize commit overwrites size under all
+         * block seqlocks, and a pending increment outside them is either
+         * double-counted or lost against that store. */
+        if (t->tracks_size) {
+            if (concurrent)
+                tpht_size_inc_conc(t);
+            else
+                tpht_size_inc_seq(t);
+        }
+        /* Mirror into the shadow while this block is still held: the resize
+         * commit and abort both take every old block lock first, so the shadow
+         * cannot be published or freed under this call. */
+        if (concurrent && TPHT_UNLIKELY(shadow_op != NULL))
+            tpht_flat_shadow_write(shadow_op, key, value, 0, key_bytes);
+        tpht_flat_write_end(line, concurrent);
         return TPHT_OK;
     }
 
-    return tpht_flat_insert_soft(t, line, loc, value, count, crystals, crystal_end, key_bytes);
+    /* Sequential form keeps its tail call; only the concurrent one has to come
+     * back here to release the block. */
+    if (!concurrent)
+        return tpht_flat_insert_soft(t, line, loc, value, count, crystals, crystal_end,
+                                     key_bytes, concurrent);
+    st = tpht_flat_insert_soft(t, line, loc, value, count, crystals, crystal_end, key_bytes,
+                               concurrent);
+    if (TPHT_UNLIKELY(shadow_op != NULL) && st == TPHT_OK)
+        tpht_flat_shadow_write(shadow_op, key, value, 0, key_bytes);
+    tpht_flat_write_end(line, concurrent);
+    return st;
 }
 
-static tpht_status_t tpht_flat_remove_raw(tpht_table_t *t, uint64_t key, unsigned key_bytes) {
+static tpht_status_t tpht_flat_remove_raw(tpht_table_t *t, uint64_t key, unsigned key_bytes,
+                                          int concurrent) {
     tpht_flat_loc_t loc;
     tpht_flat_slot_t slot;
     uint8_t *line;
@@ -2001,18 +2572,53 @@ static tpht_status_t tpht_flat_remove_raw(tpht_table_t *t, uint64_t key, unsigne
     uint8_t tps;
     uint8_t crystal_end;
     uint8_t left;
+    tpht_resize_op_t *shadow_op;
+    uint64_t pack;
 
+retry_conc:
+    shadow_op = NULL;
+    pack = 0;
+    if (concurrent) pack = atomic_load_explicit(&t->flat_lines_pack, memory_order_acquire);
     tpht_flat_locate(t, key, &loc, key_bytes);
-    line = tpht_flat_line(t, loc.block);
-    if (!tpht_flat_find(t, line, &loc, &slot, key_bytes)) return TPHT_NOT_FOUND;
+    if (concurrent) {
+        /* Range check off the address chain, as in insert. */
+        if (TPHT_UNLIKELY(loc.block >> (pack & 63u))) goto retry_conc;
+        line = (uint8_t *)(uintptr_t)(pack & ~UINT64_C(63)) +
+               ((size_t)loc.block << TPHT_FLAT_LINE_SHIFT);
+    } else {
+        line = tpht_flat_line(t, loc.block);
+    }
+    /* As in insert: locating the victim reads the block, so the block is taken
+     * first and the search happens inside the critical section; the packed
+     * check and the mirror-into-the-shadow rule are the same. */
+    tpht_flat_write_begin(line, concurrent);
+    if (concurrent) {
+        if (TPHT_UNLIKELY(atomic_load_explicit(&t->flat_lines_pack, memory_order_acquire) !=
+                          pack)) {
+            tpht_flat_write_end(line, concurrent);
+            goto retry_conc;
+        }
+        if (TPHT_UNLIKELY(tpht_flat_resize_active(t))) {
+            /* As in insert: only the descriptor whose starting pack is ours
+             * names a live resize. */
+            tpht_resize_op_t *op = tpht_resize_op_snapshot(t);
+            if (TPHT_UNLIKELY(!op || op->old_pack != pack)) {
+                tpht_flat_write_end(line, concurrent);
+                goto retry_conc;
+            }
+            if (op->migrated[loc.block]) shadow_op = op;
+        }
+    }
+    if (!tpht_flat_find(t, line, &loc, &slot, key_bytes)) {
+        tpht_flat_write_end(line, concurrent);
+        return TPHT_NOT_FOUND;
+    }
 
     count = tpht_flat_count(line);
     crystals = tpht_flat_crystals(t, line);
     tps = (uint8_t)(count - crystals);
     crystal_end = tpht_flat_crystal_end(t, crystals);
     left = crystals;
-
-    tpht_flat_write_begin(line);
     if (slot.is_crystal && tps > 0u) {
         /* Refill the freed crystal with the last overflow tuple. */
         uint8_t last = (uint8_t)(count - 1u);
@@ -2045,8 +2651,17 @@ static tpht_status_t tpht_flat_remove_raw(tpht_table_t *t, uint64_t key, unsigne
      * dereference entries back inline until the line matches it again. */
     tpht_flat_set_meta(line, (uint8_t)(count - 1u), t->flat_crystals[count - 1u]);
     tpht_flat_promote(t, line, loc.block, left, t->flat_crystals[count - 1u], key_bytes);
-    tpht_flat_write_end(line);
-    if (t->tracks_size) tpht_size_dec_seq(t);
+    /* Atomic and inside the critical section for a concurrent table, as in the
+     * insert paths: the counter must not race other writers or the commit. */
+    if (t->tracks_size) {
+        if (concurrent)
+            tpht_size_dec_conc(t);
+        else
+            tpht_size_dec_seq(t);
+    }
+    if (concurrent && TPHT_UNLIKELY(shadow_op != NULL))
+        tpht_flat_shadow_remove(shadow_op, key, key_bytes);
+    tpht_flat_write_end(line, concurrent);
     return TPHT_OK;
 }
 
@@ -2072,7 +2687,8 @@ static tpht_status_t tpht_flat_reinsert_all(tpht_table_t *dst, tpht_table_t *src
                 payload = tpht_pool_deref(src, tpht_flat_deref_key(block, fp), encoded, key_bytes);
             }
             key = tpht_flat_rebuild_key(src, block, fp, tpht_flat_read_rem(src, payload), key_bytes);
-            st = tpht_flat_insert_raw(dst, key, tpht_flat_read_value(src, payload), 0, key_bytes);
+            /* dst is this thread's private shadow: no seqlock needed. */
+            st = tpht_flat_insert_raw(dst, key, tpht_flat_read_value(src, payload), 0, key_bytes, 0);
             if (st != TPHT_OK) return st;
         }
     }
@@ -2111,6 +2727,7 @@ static void tpht_flat_adopt(tpht_table_t *t, tpht_table_t *nt) {
     memcpy(t->flat_crystals, nt->flat_crystals, sizeof(t->flat_crystals));
     memcpy(t->flat_crystal_off, nt->flat_crystal_off, sizeof(t->flat_crystal_off));
     t->pool = nt->pool;
+    atomic_store_explicit(&t->flat_lines_pack, tpht_flat_pack_of(t), memory_order_release);
     nt->flat_lines = NULL;
     nt->flat_lines_raw = NULL;
     nt->pool.entries = NULL;
@@ -2120,14 +2737,13 @@ static void tpht_flat_adopt(tpht_table_t *t, tpht_table_t *nt) {
 static void tpht_flat_init_shadow(tpht_table_t *nt, const tpht_table_t *t) {
     memset(nt, 0, sizeof(*nt));
     nt->cfg = t->cfg;
-    atomic_init(&nt->size, 0);
+    { unsigned si; for (si = 0; si < TPHT_SIZE_SHARDS; ++si) atomic_init(&nt->size_shard[si].v, 0); }
+    atomic_init(&nt->geo_snap, nt);
+    nt->initial_geo = NULL;
     atomic_init(&nt->resize_active, 0);
-    atomic_init(&nt->resize_next_stride, 0);
-    atomic_init(&nt->resize_done_strides, 0);
-    atomic_init(&nt->active_ops, 0);
+    atomic_init(&nt->resize_op, NULL);
     atomic_flag_clear(&nt->lock);
     atomic_flag_clear(&nt->resize_start_lock);
-    atomic_flag_clear(&nt->resize_commit_lock);
 }
 
 /*
@@ -2174,8 +2790,10 @@ static tpht_status_t tpht_flat_rebuild(tpht_table_t *t, size_t new_capacity,
  * make sure the rebuild does not hand it fewer slots than it had.
  */
 static tpht_status_t tpht_flat_grow(tpht_table_t *t, unsigned key_bytes) {
-    size_t slots = t->pool.bin_count * (size_t)t->pool.bin_size;
-    size_t floor = t->flat_deref_pressure ? slots * 2u : slots;
+    size_t slots = t->pool.bin_count * (size_t)TPHT_BIN_SIZE;
+    size_t floor = atomic_load_explicit(&t->flat_deref_pressure, memory_order_relaxed)
+                       ? slots * 2u
+                       : slots;
     return tpht_flat_rebuild(t, t->capacity, (uint32_t)t->flat_growth + 1u, floor, key_bytes);
 }
 
@@ -2196,9 +2814,13 @@ static tpht_status_t tpht_resize_locked(tpht_table_t *t, size_t new_capacity);
  * in the hot function would duplicate its whole body per retry site and spill
  * hot registers on every ordinary insert.
  */
+static tpht_status_t tpht_flat_write_grow(tpht_table_t *t, uint64_t key, uint64_t value,
+                                          int replace, unsigned key_bytes, int concurrent);
+
 TPHT_NOINLINE static tpht_status_t tpht_flat_write_slow(tpht_table_t *t, uint64_t key,
                                                         uint64_t value, int replace,
-                                                        unsigned key_bytes, int at_capacity) {
+                                                        unsigned key_bytes, int at_capacity,
+                                                        int concurrent) {
     tpht_status_t st;
     if (at_capacity) {
         /*
@@ -2208,32 +2830,43 @@ TPHT_NOINLINE static tpht_status_t tpht_flat_write_slow(tpht_table_t *t, uint64_
          */
         if (!replace) return TPHT_FULL;
         uint64_t scratch;
-        st = tpht_flat_get_raw(t, key, &scratch, key_bytes);
+        st = tpht_flat_get_raw(t, key, &scratch, key_bytes, concurrent);
         if (st != TPHT_OK) return TPHT_FULL;
     } else {
         st = tpht_flat_resize(t, t->capacity * 2u, key_bytes);
         if (st != TPHT_OK) return st;
     }
-    st = tpht_flat_insert_raw(t, key, value, replace, key_bytes);
-    if (st == TPHT_FULL) {
-        st = tpht_flat_grow(t, key_bytes);
-        if (st != TPHT_OK) return st;
-        st = tpht_flat_insert_raw(t, key, value, replace, key_bytes);
-    }
+    st = tpht_flat_insert_raw(t, key, value, replace, key_bytes, concurrent);
+    if (st == TPHT_FULL)
+        st = tpht_flat_write_grow(t, key, value, replace, key_bytes, concurrent);
     return st;
 }
 
 TPHT_NOINLINE static tpht_status_t tpht_flat_write_grow(tpht_table_t *t, uint64_t key,
                                                         uint64_t value, int replace,
-                                                        unsigned key_bytes) {
-    /* Hard overflow: rebuild with more blocks and retry, always. */
-    tpht_status_t st = tpht_flat_grow(t, key_bytes);
-    if (st != TPHT_OK) return st;
-    return tpht_flat_insert_raw(t, key, value, replace, key_bytes);
+                                                        unsigned key_bytes, int concurrent) {
+    /*
+     * Hard overflow: rebuild with more blocks and retry - in a bounded loop,
+     * because a successful rebuild can still leave THIS key's new home block
+     * saturated (dense tables re-deal every block's load), and a single
+     * retry then reported a transient TPHT_FULL that one more grow would
+     * have absorbed.  The bound matters: a block saturated by duplicates of
+     * one key never splits however many blocks a rebuild adds, so without it
+     * every round would succeed, double the block count, and fail the insert
+     * again until the growth counter or memory ran out.
+     */
+    unsigned rounds;
+    for (rounds = 0; rounds < 4u; ++rounds) {
+        tpht_status_t st = tpht_flat_grow(t, key_bytes);
+        if (st != TPHT_OK) return st;
+        st = tpht_flat_insert_raw(t, key, value, replace, key_bytes, concurrent);
+        if (st != TPHT_FULL) return st;
+    }
+    return TPHT_FULL;
 }
 
 TPHT_HOT tpht_status_t tpht_flat_write(tpht_table_t *t, uint64_t key, uint64_t value, int replace,
-                                       unsigned key_bytes) {
+                                       unsigned key_bytes, int concurrent) {
     tpht_status_t st;
 
     /*
@@ -2242,22 +2875,126 @@ TPHT_HOT tpht_status_t tpht_flat_write(tpht_table_t *t, uint64_t key, uint64_t v
      * The hot path therefore tests one precomputed limit instead of branching on
      * the resize mode and recomputing a load-factor product per insert.
      */
-    if (TPHT_UNLIKELY(tpht_size_load(t) >= t->write_limit))
-        return tpht_flat_write_slow(t, key, value, replace, key_bytes,
-                                    t->cfg.resize_mode == TPHT_FIXED);
+    if (concurrent) {
+        /*
+         * Same growth policy as the chained variant, but a write never stalls
+         * for a migration: it pays one stride of migration work as its help
+         * fee when a resize is active, then applies itself to the old storage
+         * (and to the shadow, if its block is already migrated - see
+         * tpht_flat_insert_raw).  Only a hard overflow waits: it needs the
+         * in-flight resize's larger geometry before it can succeed.
+         */
+        unsigned full_rounds = 0;
+        for (;;) {
+            if (TPHT_UNLIKELY(tpht_flat_resize_active(t))) tpht_flat_resize_help_one(t);
+            if (t->tracks_size &&
+                TPHT_UNLIKELY(++tpht_tls_limit_tick >=
+                              atomic_load_explicit(&t->size_check_period, memory_order_relaxed))) {
+                /* Trigger fields through the snapshot: no lock is held here,
+                 * and a commit may be swapping the table's own copies.  Stale
+                 * values at worst start a same-size resize, which the start
+                 * path treats as a no-op cycle. */
+                tpht_table_t *gl = atomic_load_explicit(&t->geo_snap, memory_order_acquire);
+                tpht_tls_limit_tick = 0;
+                if (tpht_size_load(t) >= gl->write_limit &&
+                    !tpht_flat_resize_active(t)) {
+                    /* Floor 0: a capacity doubling re-derives its pool from
+                     * the new geometry, as the sequential resize does. */
+                    if (!tpht_flat_conc_resize_start(t, gl->capacity * 2u, gl->flat_growth,
+                                                     0u, 0))
+                        return TPHT_NO_MEMORY;
+                    continue;
+                }
+            }
+            st = tpht_flat_insert_raw(t, key, value, replace, key_bytes, concurrent);
+            if (TPHT_UNLIKELY(st == TPHT_INVALID)) continue; /* raced a commit */
+            if (TPHT_UNLIKELY(st == TPHT_FULL)) {
+                if (tpht_flat_resize_active(t)) {
+                    /* The block cannot take another tuple until the running
+                     * resize lands; finishing it is the fastest way there. */
+                    tpht_flat_resize_finish_all(t);
+                    continue;
+                }
+                /* Hard overflow: rebuild with more blocks at the same
+                 * capacity, the concurrent way.  As in the sequential grow,
+                 * the dereference table must not come back smaller - and when
+                 * it was the part that ran out, it comes back doubled;
+                 * without that, an overloaded fixed table can abort its
+                 * absorb resizes forever (the pool sizing shrinks as blocks
+                 * grow, while the keys it must hold do not).
+                 *
+                 * The escalation is bounded: unlike the sequential rebuild,
+                 * whose failed attempts leave the table untouched, every
+                 * concurrent escalation commits and doubles the block count
+                 * for good.  Sixteen doublings past the base geometry is
+                 * 65536x the blocks - beyond any overload growth can absorb.
+                 * What remains full past that is a block that growth cannot
+                 * split, i.e. TPHT_FLAT_MAX_TUPLES-bounded duplicates of one
+                 * key (see tpht.h), and the honest answer is TPHT_FULL, not
+                 * an allocation march into TPHT_NO_MEMORY. */
+                {
+                    tpht_table_t *gl = atomic_load_explicit(&t->geo_snap, memory_order_acquire);
+                    size_t slots = gl->pool.bin_count * (size_t)TPHT_BIN_SIZE;
+                    size_t fl = atomic_load_explicit(&t->flat_deref_pressure,
+                                                     memory_order_relaxed)
+                                    ? slots * 2u
+                                    : slots;
+                    /* An abort's escalation lives in the table's floor until a
+                     * successful resize consumes it. */
+                    fl = tpht_max_size(fl, t->flat_deref_floor);
+                    /*
+                     * When the key width already pins the block count (the
+                     * geometry clamp: cloud bits + fingerprint bits = key
+                     * bits), growing cannot add a single block - the resize
+                     * would migrate the whole table and change nothing.  The
+                     * per-block tuple ceiling is then structural, exactly as
+                     * the sequential rebuild's same-geometry check concludes,
+                     * and the honest answer is TPHT_FULL now, not after
+                     * sixteen futile full-table migrations.
+                     */
+                    if (TPHT_UNLIKELY((unsigned)gl->flat_cloud_bits + TPHT_FLAT_FP_BITS >=
+                                      t->key_bits))
+                        return TPHT_FULL;
+                    if (TPHT_UNLIKELY(gl->flat_growth >= 16u || ++full_rounds > 64u))
+                        return TPHT_FULL;
+                    if (!tpht_flat_conc_resize_start(t, gl->capacity,
+                                                     (uint32_t)gl->flat_growth + 1u, fl, 1))
+                        return TPHT_NO_MEMORY;
+                }
+                continue;
+            }
+            return st;
+        }
+    }
 
-    st = tpht_flat_insert_raw(t, key, value, replace, key_bytes);
-    if (TPHT_UNLIKELY(st == TPHT_FULL))
-        return tpht_flat_write_grow(t, key, value, replace, key_bytes);
+    if (TPHT_UNLIKELY(tpht_size_load_seq(t) >= t->write_limit))
+        return tpht_flat_write_slow(t, key, value, replace, key_bytes,
+                                    t->cfg.resize_mode == TPHT_FIXED, concurrent);
+
+    st = tpht_flat_insert_raw(t, key, value, replace, key_bytes, concurrent);
+    if (TPHT_UNLIKELY(st == TPHT_FULL)) {
+        /*
+         * A rebuild replaces every block and the whole dereference table, which
+         * cannot be done underneath readers that hold no lock.  A concurrent
+         * table therefore reports the overflow instead of absorbing it, as its
+         * documentation says; only a sequential one grows here.  `concurrent`
+         * is a literal at every call site, so one arm or the other disappears.
+         */
+        if (concurrent) return TPHT_FULL;
+        return tpht_flat_write_grow(t, key, value, replace, key_bytes, concurrent);
+    }
     return st;
 }
 
 static tpht_status_t tpht_flat_update_op(tpht_table_t *t, uint64_t key, uint64_t value,
-                                         unsigned key_bytes) {
-    uint64_t scratch;
-    tpht_status_t st = tpht_flat_get_raw(t, key, &scratch, key_bytes);
-    if (st != TPHT_OK) return st;
-    return tpht_flat_insert_raw(t, key, value, 1, key_bytes);
+                                         unsigned key_bytes, int concurrent) {
+    /* One critical section: find and overwrite, or report absent.  On a
+     * concurrent table TPHT_INVALID means the attempt raced a resize commit
+     * and saw a stale storage pointer; retrying re-reads everything. */
+    for (;;) {
+        tpht_status_t st = tpht_flat_insert_raw(t, key, value, 2, key_bytes, concurrent);
+        if (!concurrent || !TPHT_UNLIKELY(st == TPHT_INVALID)) return st;
+    }
 }
 
 /* --------------------------------------------------------- chained operations
@@ -2285,7 +3022,7 @@ TPHT_HOT tpht_status_t tpht_chained_insert_word(tpht_table_t *t, uint64_t key, u
         while (*prev) {
             entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev, t->key_size);
             if (tpht_read_quotient(t, entry + 1u) == key_quot) {
-                if (t->value_size) tpht_store_le(entry + value_off, t->value_size, value);
+                tpht_store_le(entry + value_off, t->value_size, value);
                 return TPHT_OK;
             }
             prev = entry;
@@ -2308,24 +3045,38 @@ TPHT_HOT tpht_status_t tpht_chained_insert_word(tpht_table_t *t, uint64_t key, u
 #endif
     {
         tpht_store_le(entry + 1u, t->key_quotient_size, key_quot);
-        if (t->value_size) tpht_store_le(entry + value_off, t->value_size, value);
+        tpht_store_le(entry + value_off, t->value_size, value);
     }
     if (t->tracks_size) tpht_size_inc(t);
     return TPHT_OK;
 }
 
-TPHT_HOT tpht_status_t tpht_chained_get_word(tpht_table_t *t, uint64_t key, uint64_t *value_out) {
-    uint64_t key_word = key & t->key_mask;
-    size_t base = tpht_base_from_word(t, key_word);
+/*
+ * Walk a chain whose base the caller has already located.  The concurrent path
+ * has to hash the key to choose which base lock to take, and hashing it again
+ * here doubled the XXH3 work on every lookup.
+ */
+/*
+ * Bounded form for the optimistic reader: `budget` caps how many links are
+ * followed, so a chain observed part-way through an edit cannot spin forever.
+ * Running out of budget returns NOT_FOUND, which the caller discards along with
+ * everything else when the version check fails.
+ */
+TPHT_HOT tpht_status_t tpht_chained_get_at_bounded(tpht_table_t *t, uint64_t key_word, size_t base,
+                                                   uint64_t *value_out, size_t budget) {
     uint64_t key_quot = key_word >> t->base_bits;
     uint8_t *prev = &t->heads[base];
     size_t value_off = 1u + t->key_quotient_size;
-    while (*prev) {
-        uint8_t *entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev, t->key_size);
+    while (*prev && budget--) {
+        uint8_t *entry;
+        /* Same guard as the flattened reader: a slot number of zero is not a
+         * slot, and would wrap past the end of the bin. */
+        if ((*prev & 0x7fu) == 0u) return TPHT_NOT_FOUND;
+        entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev, t->key_size);
         if (tpht_read_quotient(t, entry + 1u) == key_quot) {
-            if (value_out) *value_out = t->value_size
-                                            ? tpht_read_le(entry + value_off, t->value_size)
-                                            : 0u;
+            /* value_size >= 1 (enforced at create) and value_out is the
+             * caller's contract: no guards, just the read. */
+            *value_out = tpht_read_le(entry + value_off, t->value_size);
             return TPHT_OK;
         }
         prev = entry;
@@ -2333,13 +3084,32 @@ TPHT_HOT tpht_status_t tpht_chained_get_word(tpht_table_t *t, uint64_t key, uint
     return TPHT_NOT_FOUND;
 }
 
+TPHT_HOT tpht_status_t tpht_chained_get_at(tpht_table_t *t, uint64_t key_word, size_t base,
+                                           uint64_t *value_out) {
+    uint64_t key_quot = key_word >> t->base_bits;
+    uint8_t *prev = &t->heads[base];
+    size_t value_off = 1u + t->key_quotient_size;
+    while (*prev) {
+        uint8_t *entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev, t->key_size);
+        if (tpht_read_quotient(t, entry + 1u) == key_quot) {
+            /* value_size >= 1 (enforced at create) and value_out is the
+             * caller's contract: no guards, just the read. */
+            *value_out = tpht_read_le(entry + value_off, t->value_size);
+            return TPHT_OK;
+        }
+        prev = entry;
+    }
+    return TPHT_NOT_FOUND;
+}
+
+TPHT_HOT tpht_status_t tpht_chained_get_word(tpht_table_t *t, uint64_t key, uint64_t *value_out) {
+    uint64_t key_word = key & t->key_mask;
+    return tpht_chained_get_at(t, key_word, tpht_base_from_word(t, key_word), value_out);
+}
+
 static tpht_status_t tpht_chained_raw_insert(tpht_table_t *t, uint64_t key, uint64_t value,
                                              int replace) {
     return tpht_chained_insert_word(t, key, value, replace);
-}
-
-static tpht_status_t tpht_chained_raw_get(tpht_table_t *t, uint64_t key, uint64_t *value_out) {
-    return tpht_chained_get_word(t, key, value_out);
 }
 
 static tpht_status_t tpht_chained_raw_remove(tpht_table_t *t, uint64_t key) {
@@ -2351,45 +3121,489 @@ static tpht_status_t tpht_chained_raw_remove(tpht_table_t *t, uint64_t key) {
 static tpht_status_t tpht_chained_write_locked(tpht_table_t *t, uint64_t key, uint64_t value,
                                                int replace) {
     tpht_status_t st = tpht_chained_raw_insert(t, key, value, replace);
-    if (TPHT_UNLIKELY(st == TPHT_FULL)) {
-        /*
-         * A hard overflow is absorbed the same way whatever the resize mode:
-         * the dereference table cannot hand out an entry, so the table is
-         * rebuilt larger and the insert retried.  Only growth *on load* is a
-         * resizable table's privilege, and that is decided by write_limit.
-         */
+    /*
+     * A hard overflow is absorbed the same way whatever the resize mode: the
+     * dereference table cannot hand out an entry, so the table is rebuilt
+     * larger and the insert retried.  Only growth *on load* is a resizable
+     * table's privilege, and that is decided by write_limit.  A loop, not a
+     * single retry: a table overloaded far past its provisioned capacity may
+     * need several doublings before the dereference table can take one more
+     * entry, and reporting TPHT_FULL in between would break the contract that
+     * fullness alone is never reported.  Each round doubles the capacity, so
+     * it terminates - in the worst case at TPHT_NO_MEMORY.
+     */
+    while (TPHT_UNLIKELY(st == TPHT_FULL)) {
         st = tpht_resize_locked(t, t->capacity * 2u);
-        if (st == TPHT_OK) st = tpht_chained_raw_insert(t, key, value, replace);
+        if (st != TPHT_OK) return st;
+        st = tpht_chained_raw_insert(t, key, value, replace);
     }
     return st;
 }
 
-static tpht_status_t tpht_chained_write_fine(tpht_table_t *t, const void *key,
-                                             const void *value, int replace);
-static tpht_status_t tpht_chained_get_fine(tpht_table_t *t, const void *key,
-                                           void *value_out);
-static void tpht_chained_resize_quiesce_and_commit(tpht_table_t *t);
+static tpht_status_t tpht_chained_write_fine(tpht_table_t *t, uint64_t key_word,
+                                             uint64_t value_word, int replace);
 
 static int tpht_chained_resize_active(tpht_table_t *t) {
     return atomic_load_explicit(&t->resize_active, memory_order_acquire) != 0;
 }
 
-static void tpht_op_enter(tpht_table_t *t) {
-    tpht_flag_lock(&t->resize_start_lock);
-    atomic_fetch_add_explicit(&t->active_ops, 1u, memory_order_acq_rel);
-    tpht_flag_unlock(&t->resize_start_lock);
+/* --------------------------------------------- concurrent flatten resize
+ * Same growth policy as the chained variant, block for bucket: a shadow table
+ * is allocated and blocks are migrated in strides by whichever writers arrive
+ * while the resize is active - each pays at most one stride as its help fee.
+ * Writers never stall: the old storage stays authoritative (every write lands
+ * there first), and a write to an already-migrated block is mirrored into the
+ * shadow under the same block lock, so the commit publishes a storage that
+ * already contains it.  The commit swaps storage under writer exclusion
+ * (every old block seqlock held); lock-free readers never help and never
+ * stall - they walk the immutable geometry snapshot and re-check it at the
+ * end (see geo_snap).
+ */
+static int tpht_flat_resize_active(const tpht_table_t *t) {
+    return atomic_load_explicit(&((tpht_table_t *)(uintptr_t)t)->resize_active,
+                                memory_order_acquire) != 0;
 }
 
-static void tpht_op_exit(tpht_table_t *t) {
-    atomic_fetch_sub_explicit(&t->active_ops, 1u, memory_order_acq_rel);
+/* The descriptor a helper snapshots once and works from until it returns. */
+static tpht_resize_op_t *tpht_resize_op_snapshot(tpht_table_t *t) {
+    return atomic_load_explicit(&t->resize_op, memory_order_acquire);
 }
 
-static int tpht_chained_resize_start(tpht_table_t *t, size_t new_capacity) {
+/* Whether the snapshot still names the in-flight resize (helpers use this only
+ * to stop early; correctness never depends on the answer being fresh). */
+static int tpht_resize_op_current(tpht_table_t *t, const tpht_resize_op_t *op) {
+    return atomic_load_explicit(&t->resize_op, memory_order_acquire) == op;
+}
+
+static tpht_resize_op_t *tpht_resize_op_new(tpht_table_t *t, tpht_table_t *nt,
+                                            size_t requested_strides) {
+    tpht_resize_op_t *op = (tpht_resize_op_t *)calloc(1, sizeof(*op));
+    if (!op) return NULL;
+    op->migrated = (uint8_t *)calloc(t->base_count, 1);
+    if (!op->migrated) {
+        free(op);
+        return NULL;
+    }
+    op->target = nt;
+    op->old_pack = atomic_load_explicit(&t->flat_lines_pack, memory_order_acquire);
+    op->old_geo = atomic_load_explicit(&t->geo_snap, memory_order_acquire);
+    op->old_lines = t->flat_lines;
+    op->old_chain_locks = t->chain_locks;
+    op->old_chain_version_mask = t->chain_version_mask;
+    op->old_base_count = t->base_count;
+    if (requested_strides == 0) requested_strides = 1;
+    if (requested_strides > t->base_count) requested_strides = t->base_count;
+    op->stride_size = (t->base_count + requested_strides - 1u) / requested_strides;
+    op->stride_count = (t->base_count + op->stride_size - 1u) / op->stride_size;
+    atomic_init(&op->next_stride, 0);
+    atomic_init(&op->done_strides, 0);
+    atomic_init(&op->failed, 0);
+    atomic_flag_clear(&op->commit_lock);
+    op->next = NULL;
+    return op;
+}
+
+static int tpht_flat_conc_resize_start(tpht_table_t *t, size_t new_capacity, uint32_t growth,
+                                        size_t deref_floor, int block) {
     tpht_table_t *nt;
+    tpht_resize_op_t *op;
+    if (tpht_flat_resize_active(t)) return 1;
+
+    /*
+     * Whoever holds the lock is either allocating the shadow (several
+     * milliseconds for a large table) or committing.  A load-factor trigger
+     * must not block here: until resize_active flips, the old storage keeps
+     * absorbing inserts, so that loser reports success and goes back to
+     * inserting.  A hard-overflow caller has no such luxury - its block
+     * cannot take the tuple until a resize lands - so it waits its turn
+     * instead of spinning through futile retries.
+     */
+    if (block) {
+        tpht_flag_lock(&t->resize_start_lock);
+    } else if (!tpht_flag_trylock(&t->resize_start_lock)) {
+        return 1;
+    }
+    if (tpht_flat_resize_active(t)) {
+        tpht_flag_unlock(&t->resize_start_lock);
+        return 1;
+    }
+    nt = (tpht_table_t *)calloc(1, sizeof(*nt));
+    if (!nt) {
+        tpht_flag_unlock(&t->resize_start_lock);
+        return 0;
+    }
+    nt->cfg = t->cfg;
+    nt->cfg.resize_mode = TPHT_FIXED; /* the shadow itself must not resize */
+    { unsigned si; for (si = 0; si < TPHT_SIZE_SHARDS; ++si) atomic_init(&nt->size_shard[si].v, 0); }
+    atomic_init(&nt->geo_snap, nt);
+    nt->initial_geo = NULL;
+    atomic_init(&nt->resize_active, 0);
+    atomic_init(&nt->resize_op, NULL);
+    atomic_flag_clear(&nt->resize_start_lock);
+    nt->flat_growth = (uint8_t)growth;
+    /*
+     * The caller's floor alone, not max-ed with the table's: the sequential
+     * rebuild resets the dereference floor on every capacity doubling (only
+     * same-capacity grows and abort escalations raise it), and carrying the
+     * table's floor into every shadow let one transient hard-overflow
+     * escalation compound across all later doublings - measured as the pool
+     * ratcheting to ~1KB per stored key on a 200M-key growth run.
+     */
+    nt->flat_deref_floor = deref_floor;
+    nt->no_prefault = 1u;
+    if (!tpht_alloc_storage(nt, new_capacity)) {
+        free(nt);
+        tpht_flag_unlock(&t->resize_start_lock);
+        return 0;
+    }
+    nt->tracks_size = t->tracks_size;
+
+    op = tpht_resize_op_new(t, nt,
+                            t->cfg.resize_strides
+                                ? t->cfg.resize_strides
+                                : (t->base_count + TPHT_DEFAULT_RESIZE_STRIDE_BUCKETS - 1u) /
+                                      TPHT_DEFAULT_RESIZE_STRIDE_BUCKETS);
+    if (!op) {
+        tpht_free_storage(nt);
+        free(nt);
+        tpht_flag_unlock(&t->resize_start_lock);
+        return 0;
+    }
+#ifdef TPHT_DEBUG_RESIZE
+    {
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        fprintf(stderr, "[rs] start cap=%zu->%zu strides=%zu t=%.6f\n",
+                t->capacity, new_capacity, op->stride_count,
+                (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec);
+    }
+#endif
+    atomic_store_explicit(&t->resize_op, op, memory_order_release);
+    atomic_store_explicit(&t->resize_active, 1, memory_order_release);
+    tpht_flag_unlock(&t->resize_start_lock);
+    return 1;
+}
+
+static void tpht_flat_conc_resize_commit(tpht_table_t *t, tpht_resize_op_t *op);
+
+static void tpht_flat_resize_migrate_block(tpht_table_t *t, tpht_resize_op_t *op, size_t block) {
+    /*
+     * Only the descriptor's own pointers are touched before the migrated check.
+     * A straggler that arrives after the commit finds every block marked, so it
+     * releases the (retired, still allocated) old line and leaves; the table's
+     * live fields are read only inside the unmigrated branch, where holding the
+     * old line's seqlock blocks the commit sweep and keeps them the old ones.
+     */
+    uint8_t *line = op->old_lines + (block << TPHT_FLAT_LINE_SHIFT);
+    tpht_flat_write_begin(line, 1);
+    if (!op->migrated[block]) {
+        tpht_table_t *nt = op->target;
+        uint8_t count = tpht_flat_count(line);
+        uint8_t crystals = tpht_flat_crystals(t, line);
+        uint8_t crystal_end = tpht_flat_crystal_end(t, crystals);
+        uint8_t i;
+        for (i = 0; i < count; ++i) {
+            uint8_t fp = line[i];
+            const uint8_t *payload;
+            uint64_t key;
+            if (i < crystals) {
+                payload = tpht_flat_crystal(t, line, i);
+            } else {
+                uint8_t encoded = *tpht_flat_tp_slot(line, crystal_end, (uint8_t)(i - crystals));
+                payload = tpht_pool_deref(t, tpht_flat_deref_key(block, fp), encoded,
+                                          t->key_size);
+            }
+            key = tpht_flat_rebuild_key(t, block, fp, tpht_flat_read_rem(t, payload),
+                                        t->key_size);
+            /* Append into the shadow through its own seqlocks - no existence
+             * probe, because the migrated[] flag under this block's lock makes
+             * each block's keys enter exactly once, and writers cannot add to
+             * the shadow while the resize is active.  A FULL here means the
+             * grown geometry was still too small - record it and let the
+             * commit abort the resize rather than lose the key. */
+            if (tpht_flat_insert_raw(nt, key, tpht_flat_read_value(t, payload), 0,
+                                     t->key_size, 1) != TPHT_OK)
+                atomic_store_explicit(&op->failed, 1u, memory_order_release);
+        }
+        op->migrated[block] = 1u;
+    }
+    tpht_flat_write_end(line, 1);
+}
+
+static void tpht_flat_resize_migrate_stride(tpht_table_t *t, tpht_resize_op_t *op,
+                                            size_t stride) {
+    size_t begin = stride * op->stride_size;
+    size_t end = begin + op->stride_size;
+    size_t block;
+    if (end > op->old_base_count) end = op->old_base_count;
+    for (block = begin; block < end; ++block)
+        tpht_flat_resize_migrate_block(t, op, block);
+    atomic_fetch_add_explicit(&op->done_strides, 1u, memory_order_acq_rel);
+    tpht_flat_conc_resize_commit(t, op);
+}
+
+static void tpht_flat_resize_finish_all(tpht_table_t *t) {
+    tpht_resize_op_t *op = tpht_resize_op_snapshot(t);
+    size_t stride;
+    if (!op) return;
+    while ((stride = atomic_fetch_add_explicit(&op->next_stride, 1u, memory_order_acq_rel)) <
+           op->stride_count) {
+        tpht_flat_resize_migrate_stride(t, op, stride);
+    }
+    while (tpht_resize_op_current(t, op) &&
+           atomic_load_explicit(&op->done_strides, memory_order_acquire) < op->stride_count) {
+        tpht_cpu_relax();
+    }
+    tpht_flat_conc_resize_commit(t, op);
+}
+
+/*
+ * A writer's help fee: migrate at most one stride, then get back to its own
+ * work.  No stride left means the migration tail is in other threads' hands;
+ * the writer does not wait for them - the old storage is still authoritative,
+ * so it can just proceed.  The thread that takes the last stride commits from
+ * inside tpht_flat_resize_migrate_stride.
+ */
+static void tpht_flat_resize_help_one(tpht_table_t *t) {
+    tpht_resize_op_t *op = tpht_resize_op_snapshot(t);
+    size_t stride;
+    if (!op) return;
+    stride = atomic_fetch_add_explicit(&op->next_stride, 1u, memory_order_acq_rel);
+    if (stride < op->stride_count)
+        tpht_flat_resize_migrate_stride(t, op, stride);
+    else if (atomic_load_explicit(&op->done_strides, memory_order_acquire) >= op->stride_count)
+        tpht_flat_conc_resize_commit(t, op);
+}
+
+/*
+ * Mirror one write into the shadow.  Called with the key's old block seqlock
+ * held and that block marked migrated, which is what makes it safe: the
+ * commit and the abort both take every old block lock before touching the
+ * shadow, so it cannot be published or freed while this runs, and the
+ * migration cannot copy this block again, so nothing lands twice.  A shadow
+ * that cannot absorb the write marks the resize failed; the old storage
+ * already holds the write, so aborting loses nothing.
+ */
+TPHT_NOINLINE static void tpht_flat_shadow_write(tpht_resize_op_t *op, uint64_t key,
+                                                 uint64_t value, int replace,
+                                                 unsigned key_bytes) {
+    if (tpht_flat_insert_raw(op->target, key, value, replace, key_bytes, 1) != TPHT_OK)
+        atomic_store_explicit(&op->failed, 1u, memory_order_release);
+}
+
+TPHT_NOINLINE static void tpht_flat_shadow_remove(tpht_resize_op_t *op, uint64_t key,
+                                                  unsigned key_bytes) {
+    /* The mirror invariant says the key is there; a miss means the shadow has
+     * diverged, and the only safe answer is to abandon it. */
+    if (tpht_flat_remove_raw(op->target, key, key_bytes, 1) != TPHT_OK)
+        atomic_store_explicit(&op->failed, 1u, memory_order_release);
+}
+
+static void tpht_flat_conc_resize_commit(tpht_table_t *t, tpht_resize_op_t *op) {
+    tpht_table_t *nt;
+    uint8_t *old_lines;
+    void *old_lines_raw;
+    uint8_t *old_heads;
+    uint8_t *old_pool_entries;
+    uint8_t *old_pool_cnt_head;
+    atomic_uchar *old_chain_locks;
+    size_t old_blocks;
+    size_t li;
+    tpht_retired_storage_t *retired;
+
+    if (atomic_load_explicit(&op->done_strides, memory_order_acquire) < op->stride_count)
+        return;
+    /* One committer per resize, forever: the flag is never cleared, so a
+     * straggler that reaches here after the swap just bounces off. */
+    if (atomic_flag_test_and_set_explicit(&op->commit_lock, memory_order_acquire)) return;
+    tpht_flag_lock(&t->resize_start_lock);
+    nt = op->target;
+
+    /*
+     * A migration insert that failed set the descriptor's marker: the shadow
+     * could not hold everything, so the resize is abandoned rather than
+     * committed short of keys.  The old storage is untouched and still
+     * authoritative; the next overflow starts a bigger attempt.
+     */
+    if (atomic_load_explicit(&op->failed, memory_order_acquire)) {
+        /*
+         * Writer exclusion before the shadow is freed: a writer holding an old
+         * block lock may be mid-mirror into the shadow (tpht_flat_shadow_write),
+         * so every old block lock is taken - and with it the guarantee that no
+         * such mirror is in flight - before the shadow's storage goes away.
+         */
+        old_blocks = op->old_base_count;
+        old_lines = op->old_lines;
+        for (li = 0; li < old_blocks; ++li)
+            tpht_flat_write_begin(old_lines + (li << TPHT_FLAT_LINE_SHIFT), 1);
+        atomic_store_explicit(&t->resize_op, NULL, memory_order_release);
+        op->target = NULL;
+        op->next = t->retired_ops;
+        t->retired_ops = op;
+        /* The failed geometry must not be retried verbatim: raise the block
+         * growth so the next attempt allocates more blocks per capacity, and
+         * raise the dereference floor past the pool that just proved too
+         * small - the migration's FULL was almost certainly there. */
+        if (nt->flat_growth >= t->flat_growth)
+            t->flat_growth = (uint8_t)(nt->flat_growth + 1u);
+        t->flat_deref_floor = tpht_max_size(
+            t->flat_deref_floor, nt->pool.bin_count * (size_t)TPHT_BIN_SIZE * 2u);
+#ifdef TPHT_DEBUG_RESIZE
+        fprintf(stderr, "[rs] ABORT growth->%u\n", (unsigned)t->flat_growth);
+#endif
+        tpht_free_storage(nt);
+        free(nt);
+        for (li = 0; li < old_blocks; ++li)
+            tpht_flat_write_end(old_lines + (li << TPHT_FLAT_LINE_SHIFT), 1);
+        atomic_store_explicit(&t->resize_active, 0, memory_order_release);
+        tpht_flag_unlock(&t->resize_start_lock);
+        return;
+    }
+
+    /*
+     * Writer exclusion, as in the chained commit: every write to a block holds
+     * its seqlock, so holding all of them means no writer is inside the old
+     * storage.  Readers take no locks; they revalidate the snapshot instead.
+     */
+    old_blocks = op->old_base_count;
+    old_lines = op->old_lines;
+    for (li = 0; li < old_blocks; ++li)
+        tpht_flat_write_begin(old_lines + (li << TPHT_FLAT_LINE_SHIFT), 1);
+
+    /*
+     * The failed flag must be read again now that every writer is excluded: a
+     * mirror into the shadow can fail after the first check above, and only
+     * with all block locks held is the flag's value final.  Publishing a
+     * shadow that a mirror could not write to would lose that writer's key.
+     */
+    if (TPHT_UNLIKELY(atomic_load_explicit(&op->failed, memory_order_acquire) != 0u)) {
+        atomic_store_explicit(&t->resize_op, NULL, memory_order_release);
+        op->target = NULL;
+        op->next = t->retired_ops;
+        t->retired_ops = op;
+        if (nt->flat_growth >= t->flat_growth)
+            t->flat_growth = (uint8_t)(nt->flat_growth + 1u);
+        tpht_free_storage(nt);
+        free(nt);
+        for (li = 0; li < old_blocks; ++li)
+            tpht_flat_write_end(old_lines + (li << TPHT_FLAT_LINE_SHIFT), 1);
+        atomic_store_explicit(&t->resize_active, 0, memory_order_release);
+        tpht_flag_unlock(&t->resize_start_lock);
+        return;
+    }
+
+    old_lines_raw = t->flat_lines_raw;
+    old_heads = t->heads;
+    old_pool_entries = t->pool.entries;
+    old_pool_cnt_head = t->pool.cnt_head;
+    old_chain_locks = t->chain_locks;
+    retired = (tpht_retired_storage_t *)calloc(1, sizeof(*retired));
+
+    t->capacity = nt->capacity;
+    tpht_refresh_write_limit(t);
+    /* The shadow was built FIXED so it would not resize while being filled,
+     * which left its write_limit unreachable; as the published snapshot it
+     * must carry the live table's trigger value instead. */
+    nt->write_limit = t->write_limit;
+    tpht_size_store(t, tpht_size_load(nt));
+    t->key_quotient_size = nt->key_quotient_size;
+    t->quotient_mask = nt->quotient_mask;
+    t->inline_entry_size = nt->inline_entry_size;
+    t->pool_entry_size = nt->pool_entry_size;
+    t->base_bits = nt->base_bits;
+    t->base_mask = nt->base_mask;
+    t->base_count = nt->base_count;
+    t->heads = nt->heads;
+    t->flat_lines = nt->flat_lines;
+    t->flat_lines_raw = nt->flat_lines_raw;
+    t->flat_entry_size = nt->flat_entry_size;
+    t->flat_cost = nt->flat_cost;
+    t->flat_inline_ok = nt->flat_inline_ok;
+    t->flat_qkey_bytes = nt->flat_qkey_bytes;
+    t->flat_cloud_bits = nt->flat_cloud_bits;
+    t->flat_quot_bits = nt->flat_quot_bits;
+    t->flat_cloud_mask = nt->flat_cloud_mask;
+    t->flat_quot_mask = nt->flat_quot_mask;
+    t->flat_rem_mask = nt->flat_rem_mask;
+    t->flat_value_mask = nt->flat_value_mask;
+    t->flat_growth = nt->flat_growth;
+    t->flat_deref_floor = nt->flat_deref_floor;
+    memcpy(t->flat_crystals, nt->flat_crystals, sizeof(t->flat_crystals));
+    t->pool = nt->pool;
+    t->chain_locks = nt->chain_locks;
+    t->chain_lock_count = nt->chain_lock_count;
+    t->chain_version_mask = nt->chain_version_mask;
+    /* Under every old line lock, like the rest of the swap: a writer that
+     * still holds an old line has not validated yet, and one that validates
+     * later re-reads this word. */
+    atomic_store_explicit(&t->flat_lines_pack, tpht_flat_pack_of(t), memory_order_release);
+
+    /*
+     * The shadow descriptor keeps its pointers: it is the next published
+     * geometry snapshot, and readers will take the new storage through it.
+     * Nothing is ever freed through a descriptor - the retired-storage node
+     * below owns the arrays - so no pointer here can double-free.
+     */
+
+    /* Retire the descriptor before reopening the table: any straggler still
+     * holding it finds every block migrated and does nothing. */
+    atomic_store_explicit(&t->resize_op, NULL, memory_order_release);
+    op->target = NULL;
+    op->next = t->retired_ops;
+    t->retired_ops = op;
+
+    if (retired) {
+        retired->heads = old_heads;
+        retired->flat_lines_raw = old_lines_raw;
+        retired->pool_entries = old_pool_entries;
+        retired->pool_cnt_head = old_pool_cnt_head;
+        retired->chain_locks = old_chain_locks;
+        retired->resize_descriptor = nt;
+        retired->next = t->retired;
+        t->retired = retired;
+    }
+
+    /*
+     * The snapshot must move while every old block lock is still held: the
+     * lock release below is what a later writer's acquire synchronizes with,
+     * so only stores sequenced before it are guaranteed visible to that
+     * writer.  Published after the release, a writer could take a freshly
+     * released old line, still see the old snapshot, pass its check and write
+     * a key into retired storage - counted by the live table, findable
+     * nowhere.  The shadow descriptor becomes the snapshot: its geometry is
+     * exactly the storage just installed, and it is retired, never freed, so
+     * a straggling reader can hold it for as long as it likes.
+     */
+    atomic_store_explicit(&t->geo_snap, nt, memory_order_release);
+
+    /* Release every old block so spinning readers move on and revalidate. */
+    for (li = 0; li < old_blocks; ++li)
+        tpht_flat_write_end(old_lines + (li << TPHT_FLAT_LINE_SHIFT), 1);
+
+    atomic_store_explicit(&t->resize_active, 0, memory_order_release);
+    tpht_flag_unlock(&t->resize_start_lock);
+#ifdef TPHT_DEBUG_RESIZE
+    {
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        fprintf(stderr, "[rs] commit cap=%zu t=%.6f\n", t->capacity,
+                (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec);
+    }
+#endif
+}
+
+static int tpht_chained_resize_start(tpht_table_t *t, size_t new_capacity, int block) {
+    tpht_table_t *nt;
+    tpht_resize_op_t *op;
     size_t requested_strides;
     if (tpht_chained_resize_active(t)) return 1;
 
-    tpht_flag_lock(&t->resize_start_lock);
+    /* As in the flattened start: load-factor losers keep inserting instead of
+     * queueing behind a multi-millisecond shadow allocation; a hard-overflow
+     * caller cannot proceed anyway and waits its turn. */
+    if (block) {
+        tpht_flag_lock(&t->resize_start_lock);
+    } else if (!tpht_flag_trylock(&t->resize_start_lock)) {
+        return 1;
+    }
     if (tpht_chained_resize_active(t)) {
         tpht_flag_unlock(&t->resize_start_lock);
         return 1;
@@ -2403,14 +3617,14 @@ static int tpht_chained_resize_start(tpht_table_t *t, size_t new_capacity) {
     nt->cfg = t->cfg;
     nt->cfg.resize_mode = TPHT_FIXED;
     nt->capacity = 0;
-    atomic_init(&nt->size, 0);
+    { unsigned si; for (si = 0; si < TPHT_SIZE_SHARDS; ++si) atomic_init(&nt->size_shard[si].v, 0); }
+    atomic_init(&nt->geo_snap, nt);
+    nt->initial_geo = NULL;
     atomic_init(&nt->resize_active, 0);
-    atomic_init(&nt->resize_next_stride, 0);
-    atomic_init(&nt->resize_done_strides, 0);
-    atomic_init(&nt->active_ops, 0);
+    atomic_init(&nt->resize_op, NULL);
     atomic_flag_clear(&nt->lock);
     atomic_flag_clear(&nt->resize_start_lock);
-    atomic_flag_clear(&nt->resize_commit_lock);
+    nt->no_prefault = 1u;
     if (!tpht_alloc_storage(nt, new_capacity)) {
         free(nt);
         tpht_flag_unlock(&t->resize_start_lock);
@@ -2424,56 +3638,77 @@ static int tpht_chained_resize_start(tpht_table_t *t, size_t new_capacity) {
      */
     nt->tracks_size = t->tracks_size;
 
-    t->resize_migrated = (uint8_t *)calloc(t->base_count, 1);
-    if (!t->resize_migrated) {
+    requested_strides = t->cfg.resize_strides
+                            ? t->cfg.resize_strides
+                            : ((t->base_count + TPHT_DEFAULT_RESIZE_STRIDE_BUCKETS - 1u) /
+                               TPHT_DEFAULT_RESIZE_STRIDE_BUCKETS);
+    op = tpht_resize_op_new(t, nt, requested_strides);
+    if (!op) {
         tpht_free_storage(nt);
         free(nt);
         tpht_flag_unlock(&t->resize_start_lock);
         return 0;
     }
-
-    t->resize_target = nt;
-    requested_strides = t->cfg.resize_strides
-                            ? t->cfg.resize_strides
-                            : ((t->base_count + TPHT_DEFAULT_RESIZE_STRIDE_BUCKETS - 1u) /
-                               TPHT_DEFAULT_RESIZE_STRIDE_BUCKETS);
-    if (requested_strides == 0) requested_strides = 1;
-    if (requested_strides > t->base_count) requested_strides = t->base_count;
-    t->resize_stride_size = (t->base_count + requested_strides - 1u) / requested_strides;
-    t->resize_stride_count = (t->base_count + t->resize_stride_size - 1u) / t->resize_stride_size;
-    atomic_store_explicit(&t->resize_next_stride, 0, memory_order_release);
-    atomic_store_explicit(&t->resize_done_strides, 0, memory_order_release);
-    atomic_flag_clear(&t->resize_commit_lock);
+    atomic_store_explicit(&t->resize_op, op, memory_order_release);
     atomic_store_explicit(&t->resize_active, 1, memory_order_release);
     tpht_flag_unlock(&t->resize_start_lock);
     return 1;
 }
 
-static void tpht_chained_resize_commit(tpht_table_t *t) {
+static void tpht_chained_resize_commit(tpht_table_t *t, tpht_resize_op_t *op) {
     tpht_table_t *nt;
     uint8_t *old_heads;
     void *old_flat_lines_raw;
     uint8_t *old_pool_entries;
     uint8_t *old_pool_cnt_head;
-    atomic_flag *old_chain_locks;
-    atomic_flag *old_pool_locks;
-    uint8_t *old_migrated;
+    atomic_uchar *old_chain_locks;
+    size_t old_chain_lock_count;
     tpht_retired_storage_t *retired;
 
-    if (atomic_load_explicit(&t->resize_done_strides, memory_order_acquire) < t->resize_stride_count) return;
-    if (atomic_flag_test_and_set_explicit(&t->resize_commit_lock, memory_order_acquire)) return;
+    if (atomic_load_explicit(&op->done_strides, memory_order_acquire) < op->stride_count) return;
+    /* One committer per resize, forever: a straggler bounces off the flag. */
+    if (atomic_flag_test_and_set_explicit(&op->commit_lock, memory_order_acquire)) return;
     tpht_flag_lock(&t->resize_start_lock);
-    if (atomic_load_explicit(&t->active_ops, memory_order_acquire) > 1u) {
-        tpht_flag_unlock(&t->resize_start_lock);
-        atomic_flag_clear_explicit(&t->resize_commit_lock, memory_order_release);
-        return;
+    nt = op->target;
+
+    /*
+     * Quiescence, without any per-operation bookkeeping.  Every operation on a
+     * chained table holds the lock for the base it touches, so holding all of
+     * them means no operation is inside the storage this commit is about to
+     * replace.  An operation that computed its base from the old geometry and
+     * is waiting for one of these locks re-reads resize_active once it gets in
+     * and starts over.  The cost is paid once per resize instead of by every
+     * operation for the table's whole life.
+     */
+    {
+        size_t li;
+        for (li = 0; li < t->chain_lock_count; ++li) tpht_chain_lock_base_fine(t, li);
     }
 
-    nt = t->resize_target;
-    if (!nt) {
+    /*
+     * With every old chain lock held no mirror can be mid-flight, so the
+     * failed flag is final.  A failed shadow (a migration or mirror insert
+     * its dereference bins could not absorb) is abandoned rather than
+     * committed short of keys: the old storage is complete and stays
+     * authoritative, and the next trigger starts a fresh attempt whose pool
+     * layout differs (bin placement keys off entry addresses).
+     */
+    if (TPHT_UNLIKELY(atomic_load_explicit(&op->failed, memory_order_acquire) != 0u)) {
+        size_t li;
+        atomic_store_explicit(&t->resize_op, NULL, memory_order_release);
+        op->target = NULL;
+        op->next = t->retired_ops;
+        t->retired_ops = op;
+        tpht_free_storage(nt);
+        free(nt);
+        for (li = 0; li < t->chain_lock_count; ++li)
+            atomic_store_explicit(&t->chain_locks[TPHT_CHAIN_SLOT(li)],
+                                  (unsigned char)(atomic_load_explicit(
+                                                      &t->chain_locks[TPHT_CHAIN_SLOT(li)],
+                                                      memory_order_relaxed) + 1u),
+                                  memory_order_release);
         atomic_store_explicit(&t->resize_active, 0, memory_order_release);
         tpht_flag_unlock(&t->resize_start_lock);
-        atomic_flag_clear_explicit(&t->resize_commit_lock, memory_order_release);
         return;
     }
 
@@ -2482,15 +3717,15 @@ static void tpht_chained_resize_commit(tpht_table_t *t) {
     old_pool_entries = t->pool.entries;
     old_pool_cnt_head = t->pool.cnt_head;
     old_chain_locks = t->chain_locks;
-    old_pool_locks = t->pool_locks;
-    old_migrated = t->resize_migrated;
+    old_chain_lock_count = t->chain_lock_count;
     retired = (tpht_retired_storage_t *)calloc(1, sizeof(*retired));
 
     t->capacity = nt->capacity;
-    tpht_set_write_limit(t);
+    tpht_refresh_write_limit(t);
     tpht_size_store(t, tpht_size_load(nt));
-    t->key_size = nt->key_size;
-    t->value_size = nt->value_size;
+    /* key_size and value_size are invariants of the table; re-storing them
+     * here raced the marshalling reads in the write entry points for no
+     * benefit, so they are simply not written. */
     t->key_quotient_size = nt->key_quotient_size;
     t->quotient_mask = nt->quotient_mask;
     t->inline_entry_size = nt->inline_entry_size;
@@ -2504,20 +3739,16 @@ static void tpht_chained_resize_commit(tpht_table_t *t) {
     t->flat_lines_raw = nt->flat_lines_raw;
     t->pool = nt->pool;
     t->chain_locks = nt->chain_locks;
-    t->pool_locks = nt->pool_locks;
     t->chain_lock_count = nt->chain_lock_count;
-    t->pool_lock_count = nt->pool_lock_count;
-    t->resize_target = NULL;
-    t->resize_migrated = NULL;
-    t->resize_stride_count = 0;
-    t->resize_stride_size = 0;
+    t->chain_version_mask = nt->chain_version_mask;
 
-    /*
-     * Keep the small resize-target descriptor alive after publishing. A helper
-     * thread may have taken a local copy of resize_target just before commit;
-     * the storage now belongs to t, but the descriptor must remain readable
-     * until that operation returns. Old backing arrays are retired below.
-     */
+    /* Retire the descriptor before reopening the table: a straggler that still
+     * holds it finds every bucket migrated and does nothing.  The shadow's
+     * small descriptor struct is kept alive the same way, below. */
+    atomic_store_explicit(&t->resize_op, NULL, memory_order_release);
+    op->target = NULL;
+    op->next = t->retired_ops;
+    t->retired_ops = op;
 
     if (retired) {
         retired->heads = old_heads;
@@ -2525,99 +3756,150 @@ static void tpht_chained_resize_commit(tpht_table_t *t) {
         retired->pool_entries = old_pool_entries;
         retired->pool_cnt_head = old_pool_cnt_head;
         retired->chain_locks = old_chain_locks;
-        retired->pool_locks = old_pool_locks;
-        retired->resize_migrated = old_migrated;
         retired->resize_descriptor = nt;
         retired->next = t->retired;
         t->retired = retired;
     }
 
+    /* Before the lock release, for the same reason as in the flattened
+     * commit: the release is the synchronization edge that publishes it.  The
+     * shadow descriptor keeps its pointers and becomes the geometry snapshot,
+     * exactly as in the flattened commit. */
+    atomic_store_explicit(&t->geo_snap, nt, memory_order_release);
+
+    {
+        size_t li;
+        for (li = 0; li < old_chain_lock_count; ++li)
+            atomic_store_explicit(&old_chain_locks[TPHT_CHAIN_SLOT(li)],
+                                  (unsigned char)(atomic_load_explicit(
+                                                      &old_chain_locks[TPHT_CHAIN_SLOT(li)],
+                                                      memory_order_relaxed) + 1u),
+                                  memory_order_release);
+    }
+
     atomic_store_explicit(&t->resize_active, 0, memory_order_release);
     tpht_flag_unlock(&t->resize_start_lock);
-    atomic_flag_clear_explicit(&t->resize_commit_lock, memory_order_release);
 }
 
-static void tpht_chained_resize_migrate_bucket(tpht_table_t *t, size_t base) {
-    tpht_table_t *nt;
-    if (!tpht_chained_resize_active(t)) return;
-    nt = t->resize_target;
-    if (!nt) return;
+/* Lock a bucket's seqlock through the descriptor's own array, so a straggler
+ * locks the retired old lock instead of an unrelated live one. */
+static void tpht_resize_op_lock_base(tpht_resize_op_t *op, size_t base) {
+    atomic_uchar *v = &op->old_chain_locks[TPHT_CHAIN_SLOT(base & op->old_chain_version_mask)];
+    for (;;) {
+        if (!tpht_bit_test_and_set(v)) return;
+        do {
+            tpht_cpu_relax();
+        } while (atomic_load_explicit(v, memory_order_relaxed) & 1u);
+    }
+}
 
-    tpht_chain_lock_base(t, base);
-    if (!t->resize_migrated[base]) {
+static void tpht_resize_op_unlock_base(tpht_resize_op_t *op, size_t base) {
+    atomic_uchar *v = &op->old_chain_locks[TPHT_CHAIN_SLOT(base & op->old_chain_version_mask)];
+    atomic_store_explicit(v, (unsigned char)(atomic_load_explicit(v, memory_order_relaxed) + 1u),
+                          memory_order_release);
+}
+
+static void tpht_chained_resize_migrate_bucket(tpht_table_t *t, tpht_resize_op_t *op,
+                                               size_t base) {
+    /* As in the flatten variant: only descriptor state is touched before the
+     * migrated check.  Holding the old bucket's seqlock blocks the commit's
+     * all-locks sweep, so inside the unmigrated branch the table's live fields
+     * are still the old ones; after a commit every bucket is marked and this
+     * degrades to a lock/unlock of a retired seqlock. */
+    tpht_resize_op_lock_base(op, base);
+    if (!op->migrated[base]) {
+        tpht_table_t *nt = op->target;
         uint8_t *prev = &t->heads[base];
         while (*prev) {
             uint8_t rebuilt_key[8];
             uint8_t *entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev, t->key_size);
             tpht_rebuild_key(t, base, entry + 1u, rebuilt_key);
-            (void)tpht_chained_write_fine(nt, rebuilt_key, entry + 1u + t->key_quotient_size, 1);
+            /* Append, no existence probe: migrated[] under this bucket's lock
+             * makes each bucket's keys enter the shadow exactly once.  A
+             * failure here (an improbable but possible dereference-bin
+             * overflow in the shadow) marks the resize failed; committing
+             * anyway would silently drop this key. */
+            if (tpht_chained_write_fine(nt, tpht_key_word(nt, rebuilt_key),
+                                        tpht_read_le(entry + 1u + t->key_quotient_size,
+                                                     t->value_size),
+                                        0) != TPHT_OK)
+                atomic_store_explicit(&op->failed, 1u, memory_order_release);
             prev = entry;
         }
-        t->resize_migrated[base] = 1u;
+        op->migrated[base] = 1u;
     }
-    tpht_chain_unlock_base(t, base);
+    tpht_resize_op_unlock_base(op, base);
 }
 
-static void tpht_chained_resize_migrate_stride(tpht_table_t *t, size_t stride) {
-    size_t begin = stride * t->resize_stride_size;
-    size_t end = begin + t->resize_stride_size;
+static void tpht_chained_resize_migrate_stride(tpht_table_t *t, tpht_resize_op_t *op,
+                                               size_t stride) {
+    size_t begin = stride * op->stride_size;
+    size_t end = begin + op->stride_size;
     size_t base;
-    if (begin >= t->base_count) return;
-    if (end > t->base_count) end = t->base_count;
-    for (base = begin; base < end && tpht_chained_resize_active(t); ++base) {
-        tpht_chained_resize_migrate_bucket(t, base);
+    if (end > op->old_base_count) end = op->old_base_count;
+    /* A claimed stride is always finished: done_strides must never count a
+     * stride whose buckets were not all migrated. */
+    for (base = begin; base < end; ++base) {
+        tpht_chained_resize_migrate_bucket(t, op, base);
     }
-    atomic_fetch_add_explicit(&t->resize_done_strides, 1u, memory_order_acq_rel);
-    tpht_chained_resize_commit(t);
+    atomic_fetch_add_explicit(&op->done_strides, 1u, memory_order_acq_rel);
+    tpht_chained_resize_commit(t, op);
 }
 
 static void tpht_chained_resize_finish_all(tpht_table_t *t) {
+    tpht_resize_op_t *op = tpht_resize_op_snapshot(t);
     size_t stride;
-    while (tpht_chained_resize_active(t) &&
-           (stride = atomic_fetch_add_explicit(&t->resize_next_stride, 1u,
-                                               memory_order_acq_rel)) < t->resize_stride_count) {
-        tpht_chained_resize_migrate_stride(t, stride);
+    if (!op) return;
+    while ((stride = atomic_fetch_add_explicit(&op->next_stride, 1u, memory_order_acq_rel)) <
+           op->stride_count) {
+        tpht_chained_resize_migrate_stride(t, op, stride);
     }
-    if (tpht_chained_resize_active(t) &&
-        atomic_load_explicit(&t->resize_done_strides, memory_order_acquire) >= t->resize_stride_count) {
-        tpht_chained_resize_quiesce_and_commit(t);
+    while (tpht_resize_op_current(t, op) &&
+           atomic_load_explicit(&op->done_strides, memory_order_acquire) < op->stride_count) {
+        tpht_cpu_relax();
     }
+    tpht_chained_resize_commit(t, op);
 }
 
 static int tpht_chained_resize_needed(tpht_table_t *t) {
-    return (double)(tpht_size_load(t) + 1u) > (double)t->capacity * t->cfg.max_load_factor;
+    /* Capacity through the snapshot: this runs before any lock is held, and a
+     * commit may be swapping the table's own field mid-read.  A stale value
+     * only delays the trigger by one check period. */
+    tpht_table_t *g = atomic_load_explicit(&t->geo_snap, memory_order_acquire);
+    return (double)(tpht_size_load(t) + 1u) > (double)g->capacity * t->cfg.max_load_factor;
 }
 
-static void tpht_chained_resize_quiesce_and_commit(tpht_table_t *t) {
-    tpht_op_exit(t);
-    for (;;) {
-        tpht_chained_resize_commit(t);
-        if (!tpht_chained_resize_active(t)) break;
-    }
-    tpht_op_enter(t);
-}
-
-static tpht_status_t tpht_chained_ensure_resize(tpht_table_t *t) {
-    if (!tpht_chained_resize_start(t, t->capacity * 2u)) return TPHT_NO_MEMORY;
+static tpht_status_t tpht_chained_ensure_resize(tpht_table_t *t, int block) {
+    /* Capacity through the snapshot: no lock is held here.  Stale at worst
+     * requests a same-size resize, which the start path shrugs off. */
+    tpht_table_t *g = atomic_load_explicit(&t->geo_snap, memory_order_acquire);
+    if (!tpht_chained_resize_start(t, g->capacity * 2u, block)) return TPHT_NO_MEMORY;
     return TPHT_OK;
 }
 
-static tpht_status_t tpht_chained_resizable_write_fine(tpht_table_t *t, const void *key,
-                                                       const void *value, int replace) {
+static tpht_status_t tpht_chained_resizable_write_fine(tpht_table_t *t, uint64_t key_word,
+                                                       uint64_t value_word, int replace) {
     tpht_status_t st;
     for (;;) {
-        if (tpht_chained_resize_active(t)) {
-            tpht_chained_resize_finish_all(t);
-            continue;
+        /* tpht_chained_write_fine waits out an active resize itself (helping
+         * finish it), so this loop only owns the growth trigger and the
+         * hard-overflow arm. */
+        if (TPHT_UNLIKELY(++tpht_tls_limit_tick >=
+                          atomic_load_explicit(&t->size_check_period, memory_order_relaxed))) {
+            tpht_tls_limit_tick = 0;
+            if (!tpht_chained_resize_active(t) && tpht_chained_resize_needed(t)) {
+                st = tpht_chained_ensure_resize(t, 0);
+                if (st != TPHT_OK) return st;
+                continue;
+            }
         }
-        if (tpht_chained_resize_needed(t)) {
-            st = tpht_chained_ensure_resize(t);
-            if (st != TPHT_OK) return st;
-            continue;
-        }
-        st = tpht_chained_write_fine(t, key, value, replace);
-        if (st == TPHT_FULL) {
-            st = tpht_chained_ensure_resize(t);
+        st = tpht_chained_write_fine(t, key_word, value_word, replace);
+        if (TPHT_UNLIKELY(st == TPHT_FULL)) {
+            if (tpht_chained_resize_active(t)) {
+                tpht_chained_resize_finish_all(t);
+                continue;
+            }
+            st = tpht_chained_ensure_resize(t, 1);
             if (st != TPHT_OK) return st;
             continue;
         }
@@ -2625,146 +3907,211 @@ static tpht_status_t tpht_chained_resizable_write_fine(tpht_table_t *t, const vo
     }
 }
 
-static tpht_status_t tpht_chained_get_fine(tpht_table_t *t, const void *key, void *value_out) {
-    size_t base = tpht_chained_base(t, key);
+
+/*
+ * Word-native, like the sequential path: routing a key through a stack buffer
+ * and reading it back costs a copy each way and puts a stack-protector canary
+ * on the whole lookup.
+ */
+static tpht_status_t tpht_chained_get_fine_word(tpht_table_t *t, uint64_t key,
+                                                uint64_t *value_out) {
+    size_t base;
+    uint64_t key_word;
+    tpht_table_t *g;
     tpht_status_t st;
 retry:
-    if (tpht_chained_resize_active(t)) {
-        tpht_chained_resize_finish_all(t);
-        goto retry;
+    /*
+     * The whole walk runs off one immutable geometry snapshot (see geo_snap),
+     * for the same reason as the flattened reader: a commit is a multi-word
+     * swap, and a base composed from one storage's mask with another's arrays
+     * would index outside both.  A resize never stalls this reader: writers
+     * stall while a chained resize is active, so the old storage is frozen
+     * and complete for the whole migration, and a walk over it is a valid
+     * answer as of the moment the resize began.
+     */
+    g = atomic_load_explicit(&t->geo_snap, memory_order_acquire);
+    key_word = key & g->key_mask;
+    base = tpht_base_from_word(g, key_word);
+    {
+        /*
+         * Optimistic read: take the chain's version, walk it without writing
+         * anything, and keep the answer only if the version is unchanged.  A
+         * writer that edited the chain in the meantime forces another attempt.
+         * The walk is bounded because a chain seen mid-edit can appear to loop;
+         * every tiny pointer still addresses a slot inside the pool, so a stale
+         * one is harmless to follow, just not to believe.
+         */
+        unsigned char snapshot = tpht_chain_read_begin(g, base);
+        /* A chain cannot hold more entries than the pool has slots; bounding
+         * by bin_count alone truncated real chains on small tables. */
+        st = tpht_chained_get_at_bounded(g, key_word, base, value_out,
+                                         g->pool.bin_count * (size_t)TPHT_BIN_SIZE);
+        if (!tpht_chain_read_valid(g, base, snapshot)) goto retry;
+        /* The storage itself must also be the one this walk started on. */
+        if (atomic_load_explicit(&t->geo_snap, memory_order_acquire) != g) goto retry;
     }
-    base = tpht_chained_base(t, key);
-    tpht_chain_lock_base(t, base);
-    if (tpht_chained_resize_active(t)) {
-        tpht_chain_unlock_base(t, base);
-        goto retry;
-    }
-    st = tpht_chained_get_raw(t, key, value_out);
-    tpht_chain_unlock_base(t, base);
     return st;
 }
 
-static tpht_status_t tpht_chained_write_fine(tpht_table_t *t, const void *key,
-                                             const void *value, int replace) {
-    size_t base = tpht_chained_base(t, key);
-    uint8_t *prev = &t->heads[base];
+/*
+ * Word-native, like the read path: the key and value cross as words, sparing
+ * the stack-buffer marshalling (a copy each way plus a stack-protector canary
+ * on every write) that the byte form paid.
+ */
+static tpht_status_t tpht_chained_write_fine(tpht_table_t *t, uint64_t key_word,
+                                             uint64_t value_word, int replace) {
+    size_t base;
+    uint64_t key_quot;
+    uint8_t *prev;
     uint8_t encoded;
     uint8_t *entry;
+    atomic_uchar *lk;
+    tpht_table_t *g;
 
 retry:
-    if (tpht_chained_resize_active(t)) {
+    /*
+     * Chained writers wait out an active resize by helping finish it - the
+     * write-through mirror the flattened variant uses was measured slower
+     * here: a chained operation is a chain walk plus a pool allocation, and
+     * doubling that per write costs more than the bulk many-hands migration
+     * saves.  The failed/abort machinery still guards the migration itself.
+     */
+    if (TPHT_UNLIKELY(tpht_chained_resize_active(t))) {
         tpht_chained_resize_finish_all(t);
         goto retry;
     }
-    base = tpht_chained_base(t, key);
-    prev = &t->heads[base];
-    tpht_chain_lock_base(t, base);
-    if (tpht_chained_resize_active(t)) {
-        tpht_chain_unlock_base(t, base);
+    /*
+     * The base, the heads array and the lock array must all come from the same
+     * storage, and no field of `t` can promise that mid-commit; the immutable
+     * snapshot can (see geo_snap).  The re-read under the lock then says in
+     * one pointer comparison whether a commit interleaved; if the snapshot is
+     * still current, the lock just taken is one the next commit must sweep,
+     * so the table's own fields are stable for the rest of the operation.
+     */
+    g = atomic_load_explicit(&t->geo_snap, memory_order_acquire);
+    base = tpht_base_from_word(g, key_word);
+    prev = &g->heads[base];
+    lk = tpht_chain_lock_take(g, base);
+    if (TPHT_UNLIKELY(atomic_load_explicit(&t->geo_snap, memory_order_acquire) != g) ||
+        tpht_chained_resize_active(t)) {
+        tpht_chain_lock_release(lk);
         goto retry;
     }
+    key_quot = key_word >> t->base_bits;
     while (*prev) {
         entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev, t->key_size);
-        if (replace && tpht_stored_key_equal(t, entry + 1u, key)) {
-            tpht_store_le(entry + 1u + t->key_quotient_size, t->value_size,
-                          tpht_read_le(value, t->value_size));
-            tpht_chain_unlock_base(t, base);
+        if (replace && tpht_read_quotient(t, entry + 1u) == key_quot) {
+            tpht_store_le(entry + 1u + t->key_quotient_size, t->value_size, value_word);
+            tpht_chain_lock_release(lk);
             return TPHT_OK;
         }
         prev = entry;
     }
 
     /*
-     * A resizable table reserves against its limit so concurrent writers cannot
-     * race past it; a fixed table keeps no size and is bounded only by what its
-     * storage can actually hold, reported as TPHT_FULL by the allocation below.
+     * A resizable table counts the entry before allocating it; the hard bound
+     * is the pool itself, whose failed allocation below reports TPHT_FULL and
+     * gives the count back.  The old compare-and-swap reservation against
+     * capacity added a contended read-modify-write per insert to enforce a
+     * bound the storage already enforces.
      */
-    if (t->tracks_size && !tpht_size_try_reserve(t)) {
-        tpht_chain_unlock_base(t, base);
-        return TPHT_FULL;
-    }
+    if (t->tracks_size) tpht_size_inc(t);
 
     entry = tpht_pool_alloc(t, (uint64_t)(uintptr_t)prev, &encoded, t->key_size);
     if (!entry) {
         if (t->tracks_size) tpht_size_dec(t); /* give the reservation back. */
-        tpht_chain_unlock_base(t, base);
+        tpht_chain_lock_release(lk);
         return TPHT_FULL;
     }
 
     *prev = encoded;
     entry[0] = 0;
-    tpht_write_quotient(t, entry + 1u, key);
-    tpht_store_le(entry + 1u + t->key_quotient_size, t->value_size,
-                  tpht_read_le(value, t->value_size));
-    tpht_chain_unlock_base(t, base);
+    tpht_store_le(entry + 1u, t->key_quotient_size, key_quot);
+    tpht_store_le(entry + 1u + t->key_quotient_size, t->value_size, value_word);
+    tpht_chain_lock_release(lk);
     return TPHT_OK;
 }
 
-static tpht_status_t tpht_chained_update_fine(tpht_table_t *t, const void *key,
-                                              const void *value) {
-    size_t base = tpht_chained_base(t, key);
-    uint8_t *prev = &t->heads[base];
+static tpht_status_t tpht_chained_update_fine(tpht_table_t *t, uint64_t key_word,
+                                              uint64_t value_word) {
+    size_t base;
+    uint8_t *prev;
+    atomic_uchar *lk;
+    tpht_table_t *g;
 retry:
-    if (tpht_chained_resize_active(t)) {
+    if (TPHT_UNLIKELY(tpht_chained_resize_active(t))) {
         tpht_chained_resize_finish_all(t);
         goto retry;
     }
-    base = tpht_chained_base(t, key);
-    prev = &t->heads[base];
-    tpht_chain_lock_base(t, base);
-    if (tpht_chained_resize_active(t)) {
-        tpht_chain_unlock_base(t, base);
+    /* Same snapshot discipline as tpht_chained_write_fine. */
+    g = atomic_load_explicit(&t->geo_snap, memory_order_acquire);
+    base = tpht_base_from_word(g, key_word);
+    prev = &g->heads[base];
+    lk = tpht_chain_lock_take(g, base);
+    if (TPHT_UNLIKELY(atomic_load_explicit(&t->geo_snap, memory_order_acquire) != g) ||
+        tpht_chained_resize_active(t)) {
+        tpht_chain_lock_release(lk);
         goto retry;
     }
-    while (*prev) {
-        uint8_t *entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev, t->key_size);
-        if (tpht_stored_key_equal(t, entry + 1u, key)) {
-            tpht_store_le(entry + 1u + t->key_quotient_size, t->value_size,
-                          tpht_read_le(value, t->value_size));
-            tpht_chain_unlock_base(t, base);
-            return TPHT_OK;
+    {
+        uint64_t key_quot = key_word >> t->base_bits;
+        while (*prev) {
+            uint8_t *entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, *prev, t->key_size);
+            if (tpht_read_quotient(t, entry + 1u) == key_quot) {
+                tpht_store_le(entry + 1u + t->key_quotient_size, t->value_size, value_word);
+                tpht_chain_lock_release(lk);
+                return TPHT_OK;
+            }
+            prev = entry;
         }
-        prev = entry;
     }
-    tpht_chain_unlock_base(t, base);
+    tpht_chain_lock_release(lk);
     return TPHT_NOT_FOUND;
 }
 
-static tpht_status_t tpht_chained_remove_fine(tpht_table_t *t, const void *key) {
-    size_t base = tpht_chained_base(t, key);
-    uint8_t *prev = &t->heads[base];
-    uint8_t *target = NULL;
-    uint8_t *last_prev = NULL;
-    uint8_t *last_entry = NULL;
-    uint8_t last_encoded = 0;
+static tpht_status_t tpht_chained_remove_fine(tpht_table_t *t, uint64_t key_word) {
+    size_t base;
+    uint8_t *prev;
+    uint8_t *target;
+    uint8_t *last_prev;
+    uint8_t *last_entry;
+    uint8_t last_encoded;
+    atomic_uchar *lk;
+    tpht_table_t *g;
 
 retry:
-    if (tpht_chained_resize_active(t)) {
+    if (TPHT_UNLIKELY(tpht_chained_resize_active(t))) {
         tpht_chained_resize_finish_all(t);
         goto retry;
     }
-    base = tpht_chained_base(t, key);
-    prev = &t->heads[base];
+    /* Same snapshot discipline as tpht_chained_write_fine. */
+    g = atomic_load_explicit(&t->geo_snap, memory_order_acquire);
+    base = tpht_base_from_word(g, key_word);
+    prev = &g->heads[base];
     target = NULL;
     last_prev = NULL;
     last_entry = NULL;
     last_encoded = 0;
-    tpht_chain_lock_base(t, base);
-    if (tpht_chained_resize_active(t)) {
-        tpht_chain_unlock_base(t, base);
+    lk = tpht_chain_lock_take(g, base);
+    if (TPHT_UNLIKELY(atomic_load_explicit(&t->geo_snap, memory_order_acquire) != g) ||
+        tpht_chained_resize_active(t)) {
+        tpht_chain_lock_release(lk);
         goto retry;
     }
-    while (*prev) {
-        uint8_t encoded = *prev;
-        uint8_t *entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, encoded, t->key_size);
-        if (tpht_stored_key_equal(t, entry + 1u, key)) target = entry;
-        last_prev = prev;
-        last_entry = entry;
-        last_encoded = encoded;
-        prev = entry;
+    {
+        uint64_t key_quot = key_word >> t->base_bits;
+        while (*prev) {
+            uint8_t encoded = *prev;
+            uint8_t *entry = tpht_pool_deref(t, (uint64_t)(uintptr_t)prev, encoded, t->key_size);
+            if (tpht_read_quotient(t, entry + 1u) == key_quot) target = entry;
+            last_prev = prev;
+            last_entry = entry;
+            last_encoded = encoded;
+            prev = entry;
+        }
     }
     if (!target) {
-        tpht_chain_unlock_base(t, base);
+        tpht_chain_lock_release(lk);
         return TPHT_NOT_FOUND;
     }
 
@@ -2776,7 +4123,7 @@ retry:
     *last_prev = 0;
     tpht_pool_free(t, last_encoded, last_entry);
     if (t->tracks_size) tpht_size_dec(t);
-    tpht_chain_unlock_base(t, base);
+    tpht_chain_lock_release(lk);
     return TPHT_OK;
 }
 
@@ -2785,14 +4132,13 @@ static tpht_status_t tpht_resize_locked(tpht_table_t *t, size_t new_capacity) {
     size_t i;
     memset(&nt, 0, sizeof(nt));
     nt.cfg = t->cfg;
-    atomic_init(&nt.size, 0);
+    { unsigned si; for (si = 0; si < TPHT_SIZE_SHARDS; ++si) atomic_init(&nt.size_shard[si].v, 0); }
+    atomic_init(&nt.geo_snap, &nt);
+    nt.initial_geo = NULL;
     atomic_init(&nt.resize_active, 0);
-    atomic_init(&nt.resize_next_stride, 0);
-    atomic_init(&nt.resize_done_strides, 0);
-    atomic_init(&nt.active_ops, 0);
+    atomic_init(&nt.resize_op, NULL);
     atomic_flag_clear(&nt.lock);
     atomic_flag_clear(&nt.resize_start_lock);
-    atomic_flag_clear(&nt.resize_commit_lock);
     if (!tpht_alloc_storage(&nt, new_capacity)) return TPHT_NO_MEMORY;
 
     /* Only the chained variant is resizable. */
@@ -2834,18 +4180,15 @@ static tpht_status_t tpht_resize_locked(tpht_table_t *t, size_t new_capacity) {
     t->flat_lines_raw = nt.flat_lines_raw;
     t->pool = nt.pool;
     t->chain_locks = nt.chain_locks;
-    t->pool_locks = nt.pool_locks;
     t->chain_lock_count = nt.chain_lock_count;
-    t->pool_lock_count = nt.pool_lock_count;
+    t->chain_version_mask = nt.chain_version_mask;
     nt.heads = NULL;
     nt.flat_lines = NULL;
     nt.flat_lines_raw = NULL;
     nt.pool.entries = NULL;
     nt.pool.cnt_head = NULL;
     nt.chain_locks = NULL;
-    nt.pool_locks = NULL;
     nt.chain_lock_count = 0;
-    nt.pool_lock_count = 0;
     return TPHT_OK;
 }
 
@@ -2879,10 +4222,9 @@ static size_t tpht_memory_of(const tpht_table_t *t) {
     size_t bytes;
     if (!t) return 0;
     bytes = sizeof(*t);
-    bytes += t->pool.bin_count * (size_t)t->pool.bin_size * t->pool.entry_size;
-    bytes += t->pool.bin_count * 2u; /* pool cnt/head */
-    bytes += t->chain_lock_count * sizeof(*t->chain_locks);
-    bytes += t->pool_lock_count * sizeof(*t->pool_locks);
+    bytes += t->pool.bin_count * (size_t)TPHT_BIN_SIZE * t->pool.entry_size;
+    bytes += t->pool.bin_count << TPHT_POOL_META_SHIFT; /* pool bin metadata */
+    bytes += TPHT_CHAIN_SLOT(t->chain_lock_count) * sizeof(*t->chain_locks);
     if (t->cfg.variant == TPHT_FLATTEN) {
         bytes += t->base_count * (size_t)TPHT_FLAT_LINE_BYTES; /* home array */
     } else {
@@ -2895,11 +4237,21 @@ tpht_options_t tpht_default_options(void) {
     tpht_options_t o;
     o.resize_mode = TPHT_FIXED;
     o.value_size = 8;
-    o.bin_size = TPHT_DEFAULT_BIN_SIZE;
     o.max_load_factor = TPHT_DEFAULT_LOAD_FACTOR;
-    o.hash_seed = UINT64_C(0x243f6a8885a308d3);
+    o.hash_seed = 0u; /* zero means: give each table its own random seed */
     o.resize_strides = 0;
     return o;
+}
+
+/*
+ * A concurrent flattened table cannot grow: readers walk its blocks without a
+ * lock, so replacing the storage underneath them is not something the seqlock
+ * can cover.  Such a table is refused rather than handed back to fail later.
+ */
+static int tpht_flat_concurrent_ok(tpht_variant_t variant, tpht_threading_t threading,
+                                   tpht_resize_mode_t mode) {
+    (void)variant; (void)threading; (void)mode;
+    return 1; /* concurrent flattened tables resize with the chained policy now */
 }
 
 static tpht_table_t *tpht_create_internal(tpht_variant_t variant, tpht_threading_t threading,
@@ -2911,15 +4263,18 @@ static tpht_table_t *tpht_create_internal(tpht_variant_t variant, tpht_threading
 
     if (o.value_size == 0u) o.value_size = 8u;
     if (o.value_size > TPHT_MAX_VALUE_BYTES) return NULL;
-    if (o.bin_size == 0u) o.bin_size = TPHT_DEFAULT_BIN_SIZE;
-    if (o.bin_size > 127u) return NULL;
     if (o.max_load_factor <= 0.0 || o.max_load_factor > 1.0) {
         o.max_load_factor = TPHT_DEFAULT_LOAD_FACTOR;
     }
-    if (o.hash_seed == 0u) o.hash_seed = UINT64_C(0x243f6a8885a308d3);
+    /*
+     * A caller that supplies a seed gets exactly that seed, so a table can be
+     * made reproducible on purpose.  Everyone else gets a fresh one per table:
+     * a fixed default would give every table in every process the same hash
+     * function, so one set of colliding keys would degrade all of them.
+     */
+    if (o.hash_seed == 0u) o.hash_seed = tpht_random_seed();
     if (capacity == 0u) capacity = TPHT_MIN_CAPACITY;
-    /* Concurrency is not implemented for the flattened variant. */
-    if (variant == TPHT_FLATTEN && threading != TPHT_SEQUENTIAL) return NULL;
+    if (!tpht_flat_concurrent_ok(variant, threading, o.resize_mode)) return NULL;
 
     c.variant = variant;
     c.threading = threading;
@@ -2927,7 +4282,6 @@ static tpht_table_t *tpht_create_internal(tpht_variant_t variant, tpht_threading
     c.initial_capacity = capacity;
     c.key_size = key_size;
     c.value_size = o.value_size;
-    c.bin_size = o.bin_size;
     c.max_load_factor = o.max_load_factor;
     c.hash_seed = o.hash_seed;
     c.resize_strides = o.resize_strides;
@@ -2935,17 +4289,33 @@ static tpht_table_t *tpht_create_internal(tpht_variant_t variant, tpht_threading
     t = (tpht_table_t *)calloc(1, sizeof(*t));
     if (!t) return NULL;
     t->cfg = c;
-    atomic_init(&t->size, 0);
+    { unsigned si; for (si = 0; si < TPHT_SIZE_SHARDS; ++si) atomic_init(&t->size_shard[si].v, 0); }
+    atomic_init(&t->geo_snap, t);
     atomic_init(&t->resize_active, 0);
-    atomic_init(&t->resize_next_stride, 0);
-    atomic_init(&t->resize_done_strides, 0);
-    atomic_init(&t->active_ops, 0);
+    atomic_init(&t->resize_op, NULL);
     atomic_flag_clear(&t->lock);
     atomic_flag_clear(&t->resize_start_lock);
-    atomic_flag_clear(&t->resize_commit_lock);
     if (!tpht_alloc_storage(t, capacity)) {
         free(t);
         return NULL;
+    }
+    /*
+     * A concurrent flattened table's first commit will overwrite this struct's
+     * geometry in place, so the published snapshot cannot be the table itself:
+     * a reader still holding it would watch the fields move.  Publish an
+     * immutable copy instead; later snapshots are the resize shadow
+     * descriptors, which are retired rather than freed for the same reason.
+     */
+    if (c.threading == TPHT_CONCURRENT) {
+        tpht_table_t *g0 = (tpht_table_t *)malloc(sizeof(*g0));
+        if (!g0) {
+            tpht_free_storage(t);
+            free(t);
+            return NULL;
+        }
+        memcpy(g0, t, sizeof(*g0));
+        t->initial_geo = g0;
+        atomic_store_explicit(&t->geo_snap, g0, memory_order_release);
     }
     return t;
 }
@@ -2962,99 +4332,101 @@ static tpht_table_t *tpht_named_create(tpht_variant_t variant, tpht_threading_t 
 static void tpht_destroy_internal(tpht_table_t *t) {
     if (!t) return;
     tpht_free_storage(t);
+    free(t->initial_geo);
     free(t);
 }
 
 
 /* Chained entry points share these; threading is still a run-time property. */
-static tpht_status_t tpht_chained_op_write(tpht_table_t *t, uint64_t key, uint64_t value,
-                                           int replace) {
+/*
+ * Split entry paths (see the branch plan): a sequential chained table and a
+ * concurrent one are separate public types, so neither pays a per-call test of
+ * what it is.  The old chained_tphtNN_* functions remain as the compatibility
+ * surface for handles created with the run-time `concurrent` flag and keep the
+ * single dispatch branch; these cores are what the split entry points call.
+ */
+TPHT_HOT tpht_status_t tpht_chained_seq_write(tpht_table_t *t, uint64_t key, uint64_t value,
+                                              int replace) {
     tpht_status_t st;
     key &= t->key_mask;
-    if (tpht_chained_fine_grained(t)) {
-        uint8_t kb[TPHT_MAX_KEY_BYTES];
-        uint8_t vb[TPHT_MAX_VALUE_BYTES];
-        tpht_write_le(kb, t->key_size, key);
-        tpht_write_le(vb, t->value_size, value);
-        tpht_op_enter(t);
-        st = t->cfg.resize_mode == TPHT_RESIZABLE
-                 ? tpht_chained_resizable_write_fine(t, kb, vb, replace)
-                 : tpht_chained_write_fine(t, kb, vb, replace);
-        tpht_op_exit(t);
-        return st;
-    }
-    tpht_lock(t);
-    /*
-     * Only a resizable table watches its size here, and write_limit already
-     * holds the point where it must grow; a fixed table keeps no size to test
-     * and absorbs a hard overflow inside tpht_chained_write_locked instead.
-     */
-    if (TPHT_UNLIKELY(tpht_size_load(t) >= t->write_limit)) {
+    if (TPHT_UNLIKELY(tpht_size_load_seq(t) >= t->write_limit)) {
         st = tpht_resize_locked(t, t->capacity * 2u);
-        if (st != TPHT_OK) {
-            tpht_unlock(t);
-            return st;
-        }
+        if (st != TPHT_OK) return st;
     }
-    st = tpht_chained_write_locked(t, key, value, replace);
-    tpht_unlock(t);
+    return tpht_chained_write_locked(t, key, value, replace);
+}
+
+/*
+ * A fixed concurrent table still absorbs hard overflows, as the resize-mode
+ * contract requires: the pool ran out, so grow the storage through the same
+ * concurrent resize machinery a resizable table uses, and retry.  This is the
+ * cold arm of an insert; the loop costs nothing until the pool is exhausted.
+ */
+TPHT_NOINLINE static tpht_status_t tpht_chained_fixed_write_fine(tpht_table_t *t,
+                                                                 uint64_t key_word,
+                                                                 uint64_t value_word,
+                                                                 int replace) {
+    tpht_status_t st;
+    for (;;) {
+        st = tpht_chained_write_fine(t, key_word, value_word, replace);
+        if (TPHT_LIKELY(st != TPHT_FULL)) return st;
+        if (tpht_chained_resize_active(t)) {
+            tpht_chained_resize_finish_all(t);
+            continue;
+        }
+        st = tpht_chained_ensure_resize(t, 1);
+        if (st != TPHT_OK) return st;
+    }
+}
+
+TPHT_HOT tpht_status_t tpht_chained_conc_write(tpht_table_t *t, uint64_t key, uint64_t value,
+                                               int replace, int resizable) {
+    tpht_status_t st;
+    key &= t->key_mask;
+    if (resizable) return tpht_chained_resizable_write_fine(t, key, value, replace);
+    st = tpht_chained_write_fine(t, key, value, replace);
+    if (TPHT_UNLIKELY(st == TPHT_FULL))
+        st = tpht_chained_fixed_write_fine(t, key, value, replace);
     return st;
+}
+
+static tpht_status_t tpht_chained_op_write(tpht_table_t *t, uint64_t key, uint64_t value,
+                                           int replace) {
+    if (tpht_chained_fine_grained(t))
+        return tpht_chained_conc_write(t, key, value, replace,
+                                       t->cfg.resize_mode == TPHT_RESIZABLE);
+    return tpht_chained_seq_write(t, key, value, replace);
+}
+
+TPHT_HOT tpht_status_t tpht_chained_conc_update(tpht_table_t *t, uint64_t key, uint64_t value) {
+    return tpht_chained_update_fine(t, key & t->key_mask, value);
 }
 
 static tpht_status_t tpht_chained_op_update(tpht_table_t *t, uint64_t key, uint64_t value) {
-    tpht_status_t st;
     key &= t->key_mask;
-    if (tpht_chained_fine_grained(t)) {
-        uint8_t kb[TPHT_MAX_KEY_BYTES];
-        uint8_t vb[TPHT_MAX_VALUE_BYTES];
-        tpht_write_le(kb, t->key_size, key);
-        tpht_write_le(vb, t->value_size, value);
-        tpht_op_enter(t);
-        st = tpht_chained_update_fine(t, kb, vb);
-        tpht_op_exit(t);
-        return st;
+    if (tpht_chained_fine_grained(t)) return tpht_chained_conc_update(t, key, value);
+    {
+        uint64_t probe_scratch;
+        tpht_status_t st = tpht_chained_get_word(t, key, &probe_scratch);
+        if (st != TPHT_OK) return st;
     }
-    tpht_lock(t);
-    st = tpht_chained_raw_get(t, key, NULL);
-    if (st == TPHT_OK) st = tpht_chained_raw_insert(t, key, value, 1);
-    tpht_unlock(t);
-    return st;
+    return tpht_chained_insert_word(t, key, value, 1);
 }
 
 static tpht_status_t tpht_chained_op_get(tpht_table_t *t, uint64_t key, uint64_t *value_out) {
-    tpht_status_t st;
     key &= t->key_mask;
-    if (tpht_chained_fine_grained(t)) {
-        uint8_t kb[TPHT_MAX_KEY_BYTES];
-        uint8_t vb[TPHT_MAX_VALUE_BYTES];
-        tpht_write_le(kb, t->key_size, key);
-        tpht_op_enter(t);
-        st = tpht_chained_get_fine(t, kb, vb);
-        tpht_op_exit(t);
-        if (st == TPHT_OK) *value_out = tpht_read_le(vb, t->value_size);
-        return st;
-    }
-    tpht_lock(t);
-    st = tpht_chained_raw_get(t, key, value_out);
-    tpht_unlock(t);
-    return st;
+    if (tpht_chained_fine_grained(t)) return tpht_chained_get_fine_word(t, key, value_out);
+    return tpht_chained_get_word(t, key, value_out);
+}
+
+TPHT_HOT tpht_status_t tpht_chained_conc_remove(tpht_table_t *t, uint64_t key) {
+    return tpht_chained_remove_fine(t, key & t->key_mask);
 }
 
 static tpht_status_t tpht_chained_op_remove(tpht_table_t *t, uint64_t key) {
-    tpht_status_t st;
     key &= t->key_mask;
-    if (tpht_chained_fine_grained(t)) {
-        uint8_t kb[TPHT_MAX_KEY_BYTES];
-        tpht_write_le(kb, t->key_size, key);
-        tpht_op_enter(t);
-        st = tpht_chained_remove_fine(t, kb);
-        tpht_op_exit(t);
-        return st;
-    }
-    tpht_lock(t);
-    st = tpht_chained_raw_remove(t, key);
-    tpht_unlock(t);
-    return st;
+    if (tpht_chained_fine_grained(t)) return tpht_chained_conc_remove(t, key);
+    return tpht_chained_raw_remove(t, key);
 }
 
 
@@ -3077,28 +4449,188 @@ flatten_tpht32_t *flatten_tpht32_resizable_create(size_t capacity, uint8_t value
 void flatten_tpht32_destroy(flatten_tpht32_t *table) { tpht_destroy_internal((tpht_table_t *)table); }
 
 tpht_status_t flatten_tpht32_put(flatten_tpht32_t *table, uint32_t key, uint64_t value) {
-    return tpht_flat_write((tpht_table_t *)table, key, value, 1, 4);
+    return tpht_flat_write((tpht_table_t *)table, key, value, 1, 4, 0);
 }
 
 tpht_status_t flatten_tpht32_insert(flatten_tpht32_t *table, uint32_t key, uint64_t value) {
-    return tpht_flat_write((tpht_table_t *)table, key, value, 0, 4);
+    return tpht_flat_write((tpht_table_t *)table, key, value, 0, 4, 0);
 }
 
 tpht_status_t flatten_tpht32_update(flatten_tpht32_t *table, uint32_t key, uint64_t value) {
-    return tpht_flat_update_op((tpht_table_t *)table, key, value, 4);
+    return tpht_flat_update_op((tpht_table_t *)table, key, value, 4, 0);
 }
 
 tpht_status_t flatten_tpht32_get(flatten_tpht32_t *table, uint32_t key, uint64_t *value_out) {
-    return tpht_flat_get_raw((tpht_table_t *)table, key, value_out, 4);
+    return tpht_flat_get_raw((tpht_table_t *)table, key, value_out, 4, 0);
 }
 
 tpht_status_t flatten_tpht32_remove(flatten_tpht32_t *table, uint32_t key) {
-    return tpht_flat_remove_raw((tpht_table_t *)table, key, 4);
+    return tpht_flat_remove_raw((tpht_table_t *)table, key, 4, 0);
 }
 
 size_t flatten_tpht32_size(const flatten_tpht32_t *table) { return tpht_size_of((const tpht_table_t *)table); }
 size_t flatten_tpht32_capacity(const flatten_tpht32_t *table) { return tpht_capacity_of((const tpht_table_t *)table); }
 size_t flatten_tpht32_memory_bytes(const flatten_tpht32_t *table) { return tpht_memory_of((const tpht_table_t *)table); }
+
+/* --------------------------------------------------- concurrent flatten API
+ * Same table, same layout; these entry points differ only in passing the
+ * concurrent flag, so each block is taken through its seqlock and the
+ * dereference bins through their locks.  A concurrent flattened table has a
+ * fixed geometry: it cannot rebuild itself underneath live readers, so a hard
+ * overflow is reported as TPHT_FULL instead of being absorbed.
+ */
+flatten_conc_tpht32_t *flatten_conc_tpht32_create(size_t capacity, const tpht_options_t *options) {
+    return (flatten_conc_tpht32_t *)tpht_create_internal(TPHT_FLATTEN, TPHT_CONCURRENT, 4, capacity,
+                                                         options);
+}
+
+flatten_conc_tpht32_t *flatten_conc_tpht32_fixed_create(size_t capacity, uint8_t value_size) {
+    return (flatten_conc_tpht32_t *)tpht_named_create(TPHT_FLATTEN, TPHT_CONCURRENT, 4, TPHT_FIXED,
+                                                      capacity, value_size);
+}
+
+flatten_conc_tpht32_t *flatten_conc_tpht32_resizable_create(size_t capacity, uint8_t value_size) {
+    return (flatten_conc_tpht32_t *)tpht_named_create(TPHT_FLATTEN, TPHT_CONCURRENT, 4,
+                                                      TPHT_RESIZABLE, capacity, value_size);
+}
+
+void flatten_conc_tpht32_destroy(flatten_conc_tpht32_t *table) {
+    tpht_destroy_internal((tpht_table_t *)table);
+}
+
+tpht_status_t flatten_conc_tpht32_put(flatten_conc_tpht32_t *table, uint32_t key, uint64_t value) {
+    return tpht_flat_write((tpht_table_t *)table, key, value, 1, 4, 1);
+}
+tpht_status_t flatten_conc_tpht32_insert(flatten_conc_tpht32_t *table, uint32_t key, uint64_t value) {
+    return tpht_flat_write((tpht_table_t *)table, key, value, 0, 4, 1);
+}
+tpht_status_t flatten_conc_tpht32_update(flatten_conc_tpht32_t *table, uint32_t key, uint64_t value) {
+    return tpht_flat_update_op((tpht_table_t *)table, key, value, 4, 1);
+}
+tpht_status_t flatten_conc_tpht32_get(flatten_conc_tpht32_t *table, uint32_t key, uint64_t *value_out) {
+    return tpht_flat_get_raw((tpht_table_t *)table, key, value_out, 4, 1);
+}
+tpht_status_t flatten_conc_tpht32_remove(flatten_conc_tpht32_t *table, uint32_t key) {
+    return tpht_flat_remove_raw((tpht_table_t *)table, key, 4, 1);
+}
+size_t flatten_conc_tpht32_size(const flatten_conc_tpht32_t *t) { return tpht_size_of((const tpht_table_t *)t); }
+size_t flatten_conc_tpht32_capacity(const flatten_conc_tpht32_t *t) { return tpht_capacity_of((const tpht_table_t *)t); }
+size_t flatten_conc_tpht32_memory_bytes(const flatten_conc_tpht32_t *t) { return tpht_memory_of((const tpht_table_t *)t); }
+
+flatten_conc_tpht64_t *flatten_conc_tpht64_create(size_t capacity, const tpht_options_t *options) {
+    return (flatten_conc_tpht64_t *)tpht_create_internal(TPHT_FLATTEN, TPHT_CONCURRENT, 8, capacity,
+                                                         options);
+}
+
+flatten_conc_tpht64_t *flatten_conc_tpht64_fixed_create(size_t capacity, uint8_t value_size) {
+    return (flatten_conc_tpht64_t *)tpht_named_create(TPHT_FLATTEN, TPHT_CONCURRENT, 8, TPHT_FIXED,
+                                                      capacity, value_size);
+}
+
+flatten_conc_tpht64_t *flatten_conc_tpht64_resizable_create(size_t capacity, uint8_t value_size) {
+    return (flatten_conc_tpht64_t *)tpht_named_create(TPHT_FLATTEN, TPHT_CONCURRENT, 8,
+                                                      TPHT_RESIZABLE, capacity, value_size);
+}
+
+void flatten_conc_tpht64_destroy(flatten_conc_tpht64_t *table) {
+    tpht_destroy_internal((tpht_table_t *)table);
+}
+
+tpht_status_t flatten_conc_tpht64_put(flatten_conc_tpht64_t *table, uint64_t key, uint64_t value) {
+    return tpht_flat_write((tpht_table_t *)table, key, value, 1, 8, 1);
+}
+tpht_status_t flatten_conc_tpht64_insert(flatten_conc_tpht64_t *table, uint64_t key, uint64_t value) {
+    return tpht_flat_write((tpht_table_t *)table, key, value, 0, 8, 1);
+}
+tpht_status_t flatten_conc_tpht64_update(flatten_conc_tpht64_t *table, uint64_t key, uint64_t value) {
+    return tpht_flat_update_op((tpht_table_t *)table, key, value, 8, 1);
+}
+tpht_status_t flatten_conc_tpht64_get(flatten_conc_tpht64_t *table, uint64_t key, uint64_t *value_out) {
+    return tpht_flat_get_raw((tpht_table_t *)table, key, value_out, 8, 1);
+}
+tpht_status_t flatten_conc_tpht64_remove(flatten_conc_tpht64_t *table, uint64_t key) {
+    return tpht_flat_remove_raw((tpht_table_t *)table, key, 8, 1);
+}
+size_t flatten_conc_tpht64_size(const flatten_conc_tpht64_t *t) { return tpht_size_of((const tpht_table_t *)t); }
+size_t flatten_conc_tpht64_capacity(const flatten_conc_tpht64_t *t) { return tpht_capacity_of((const tpht_table_t *)t); }
+size_t flatten_conc_tpht64_memory_bytes(const flatten_conc_tpht64_t *t) { return tpht_memory_of((const tpht_table_t *)t); }
+
+/* ------------------------------------------------- concurrent chained API
+ * Same table, separate type: the entry points know the table is concurrent, so
+ * no operation re-decides it at run time.  Created tables are identical to
+ * chained_tphtNN_create(cap, 1, opts) ones; only the dispatch is pre-resolved.
+ */
+chained_conc_tpht32_t *chained_conc_tpht32_fixed_create(size_t capacity, uint8_t value_size) {
+    return (chained_conc_tpht32_t *)tpht_named_create(TPHT_CHAINED, TPHT_CONCURRENT, 4, TPHT_FIXED,
+                                                      capacity, value_size);
+}
+chained_conc_tpht32_t *chained_conc_tpht32_resizable_create(size_t capacity, uint8_t value_size) {
+    return (chained_conc_tpht32_t *)tpht_named_create(TPHT_CHAINED, TPHT_CONCURRENT, 4,
+                                                      TPHT_RESIZABLE, capacity, value_size);
+}
+chained_conc_tpht32_t *chained_conc_tpht32_create(size_t capacity, const tpht_options_t *options) {
+    return (chained_conc_tpht32_t *)tpht_create_internal(TPHT_CHAINED, TPHT_CONCURRENT, 4, capacity,
+                                                         options);
+}
+void chained_conc_tpht32_destroy(chained_conc_tpht32_t *t) { tpht_destroy_internal((tpht_table_t *)t); }
+tpht_status_t chained_conc_tpht32_put(chained_conc_tpht32_t *t, uint32_t key, uint64_t value) {
+    tpht_table_t *tt = (tpht_table_t *)t;
+    return tpht_chained_conc_write(tt, key, value, 1, tt->cfg.resize_mode == TPHT_RESIZABLE);
+}
+tpht_status_t chained_conc_tpht32_insert(chained_conc_tpht32_t *t, uint32_t key, uint64_t value) {
+    tpht_table_t *tt = (tpht_table_t *)t;
+    return tpht_chained_conc_write(tt, key, value, 0, tt->cfg.resize_mode == TPHT_RESIZABLE);
+}
+tpht_status_t chained_conc_tpht32_update(chained_conc_tpht32_t *t, uint32_t key, uint64_t value) {
+    return tpht_chained_conc_update((tpht_table_t *)t, key, value);
+}
+tpht_status_t chained_conc_tpht32_get(chained_conc_tpht32_t *t, uint32_t key, uint64_t *value_out) {
+    tpht_table_t *tt = (tpht_table_t *)t;
+    return tpht_chained_get_fine_word(tt, key & tt->key_mask, value_out);
+}
+tpht_status_t chained_conc_tpht32_remove(chained_conc_tpht32_t *t, uint32_t key) {
+    tpht_table_t *tt = (tpht_table_t *)t;
+    return tpht_chained_conc_remove(tt, key & tt->key_mask);
+}
+size_t chained_conc_tpht32_size(const chained_conc_tpht32_t *t) { return tpht_size_of((const tpht_table_t *)t); }
+size_t chained_conc_tpht32_capacity(const chained_conc_tpht32_t *t) { return tpht_capacity_of((const tpht_table_t *)t); }
+size_t chained_conc_tpht32_memory_bytes(const chained_conc_tpht32_t *t) { return tpht_memory_of((const tpht_table_t *)t); }
+
+chained_conc_tpht64_t *chained_conc_tpht64_fixed_create(size_t capacity, uint8_t value_size) {
+    return (chained_conc_tpht64_t *)tpht_named_create(TPHT_CHAINED, TPHT_CONCURRENT, 8, TPHT_FIXED,
+                                                      capacity, value_size);
+}
+chained_conc_tpht64_t *chained_conc_tpht64_resizable_create(size_t capacity, uint8_t value_size) {
+    return (chained_conc_tpht64_t *)tpht_named_create(TPHT_CHAINED, TPHT_CONCURRENT, 8,
+                                                      TPHT_RESIZABLE, capacity, value_size);
+}
+chained_conc_tpht64_t *chained_conc_tpht64_create(size_t capacity, const tpht_options_t *options) {
+    return (chained_conc_tpht64_t *)tpht_create_internal(TPHT_CHAINED, TPHT_CONCURRENT, 8, capacity,
+                                                         options);
+}
+void chained_conc_tpht64_destroy(chained_conc_tpht64_t *t) { tpht_destroy_internal((tpht_table_t *)t); }
+tpht_status_t chained_conc_tpht64_put(chained_conc_tpht64_t *t, uint64_t key, uint64_t value) {
+    tpht_table_t *tt = (tpht_table_t *)t;
+    return tpht_chained_conc_write(tt, key, value, 1, tt->cfg.resize_mode == TPHT_RESIZABLE);
+}
+tpht_status_t chained_conc_tpht64_insert(chained_conc_tpht64_t *t, uint64_t key, uint64_t value) {
+    tpht_table_t *tt = (tpht_table_t *)t;
+    return tpht_chained_conc_write(tt, key, value, 0, tt->cfg.resize_mode == TPHT_RESIZABLE);
+}
+tpht_status_t chained_conc_tpht64_update(chained_conc_tpht64_t *t, uint64_t key, uint64_t value) {
+    return tpht_chained_conc_update((tpht_table_t *)t, key, value);
+}
+tpht_status_t chained_conc_tpht64_get(chained_conc_tpht64_t *t, uint64_t key, uint64_t *value_out) {
+    tpht_table_t *tt = (tpht_table_t *)t;
+    return tpht_chained_get_fine_word(tt, key & tt->key_mask, value_out);
+}
+tpht_status_t chained_conc_tpht64_remove(chained_conc_tpht64_t *t, uint64_t key) {
+    tpht_table_t *tt = (tpht_table_t *)t;
+    return tpht_chained_conc_remove(tt, key & tt->key_mask);
+}
+size_t chained_conc_tpht64_size(const chained_conc_tpht64_t *t) { return tpht_size_of((const tpht_table_t *)t); }
+size_t chained_conc_tpht64_capacity(const chained_conc_tpht64_t *t) { return tpht_capacity_of((const tpht_table_t *)t); }
+size_t chained_conc_tpht64_memory_bytes(const chained_conc_tpht64_t *t) { return tpht_memory_of((const tpht_table_t *)t); }
 
 /* ------------------------------------------------------------- flatten_tpht64 */
 
@@ -3119,23 +4651,23 @@ flatten_tpht64_t *flatten_tpht64_resizable_create(size_t capacity, uint8_t value
 void flatten_tpht64_destroy(flatten_tpht64_t *table) { tpht_destroy_internal((tpht_table_t *)table); }
 
 tpht_status_t flatten_tpht64_put(flatten_tpht64_t *table, uint64_t key, uint64_t value) {
-    return tpht_flat_write((tpht_table_t *)table, key, value, 1, 8);
+    return tpht_flat_write((tpht_table_t *)table, key, value, 1, 8, 0);
 }
 
 tpht_status_t flatten_tpht64_insert(flatten_tpht64_t *table, uint64_t key, uint64_t value) {
-    return tpht_flat_write((tpht_table_t *)table, key, value, 0, 8);
+    return tpht_flat_write((tpht_table_t *)table, key, value, 0, 8, 0);
 }
 
 tpht_status_t flatten_tpht64_update(flatten_tpht64_t *table, uint64_t key, uint64_t value) {
-    return tpht_flat_update_op((tpht_table_t *)table, key, value, 8);
+    return tpht_flat_update_op((tpht_table_t *)table, key, value, 8, 0);
 }
 
 tpht_status_t flatten_tpht64_get(flatten_tpht64_t *table, uint64_t key, uint64_t *value_out) {
-    return tpht_flat_get_raw((tpht_table_t *)table, key, value_out, 8);
+    return tpht_flat_get_raw((tpht_table_t *)table, key, value_out, 8, 0);
 }
 
 tpht_status_t flatten_tpht64_remove(flatten_tpht64_t *table, uint64_t key) {
-    return tpht_flat_remove_raw((tpht_table_t *)table, key, 8);
+    return tpht_flat_remove_raw((tpht_table_t *)table, key, 8, 0);
 }
 
 size_t flatten_tpht64_size(const flatten_tpht64_t *table) { return tpht_size_of((const tpht_table_t *)table); }

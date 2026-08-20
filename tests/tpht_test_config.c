@@ -1,8 +1,11 @@
 #include "tpht_test_common.h"
 
 #include <assert.h>
+#include <stdlib.h>
 
+/* Mirrors the library's fixed dereference bin size. */
 #define TEST_BIN_SIZE 127u
+
 #define TEST_LINE_BYTES 64u
 
 static size_t test_ceil_div(size_t x, size_t div) { return (x + div - 1u) / div; }
@@ -26,7 +29,8 @@ static size_t test_chained_storage_bytes(size_t capacity, uint8_t key_size, uint
     size_t entry_size = 1u + quotient_bytes + value_size;
     size_t slots = test_ceil_div(capacity * 100u, 95u);
     size_t bins = test_ceil_div(slots, TEST_BIN_SIZE);
-    return base_count + bins * TEST_BIN_SIZE * entry_size + bins * 2u;
+    /* One 64-byte metadata record per bin: count, freelist head, bin lock. */
+    return base_count + bins * TEST_BIN_SIZE * entry_size + bins * 64u;
 }
 
 static void test_chained_layout(void) {
@@ -52,9 +56,12 @@ static void test_chained_layout(void) {
                     bytes = chained_tpht64_memory_bytes(t);
                     chained_tpht64_destroy(t);
                 }
-                /* memory_bytes also counts the table descriptor itself. */
+                /* memory_bytes also counts the table descriptor itself, whose
+                 * dominant field is the sharded size counter: one cache line
+                 * per shard plus a fence line, so concurrent writers do not
+                 * serialise on one counter line. */
                 assert(bytes >= expected);
-                assert(bytes - expected <= 1024u);
+                assert(bytes - expected <= 2048u);
             }
         }
     }
@@ -157,28 +164,40 @@ static void test_flat_block_churn(tpht_test_kind_t kind, uint8_t value_size) {
  */
 static void test_flat_hard_overflow_growth(tpht_test_kind_t kind, uint8_t value_size,
                                            tpht_resize_mode_t resize_mode) {
-    const size_t capacity = 8192u;
+    /*
+     * A hard overflow is what happens when a block cannot address another
+     * tuple, or the dereference table cannot hand out an entry.  Reaching it
+     * needs no special configuration - just more entries than the table was
+     * provisioned for.  Capacity provisions storage rather than capping it, so
+     * the table absorbs the excess by rebuilding itself with more blocks, and
+     * every key stays findable across the rebuild.
+     */
+    const size_t capacity = 4096u;
+    const size_t inserted = capacity * 6u;
     tpht_test_case_t tc;
     tpht_options_t o = tpht_default_options();
     tpht_test_table_t t;
     size_t bytes_before;
     uint64_t rng = UINT64_C(0x0dd1e5) ^ ((uint64_t)kind << 8u) ^ value_size;
-    uint64_t keys[8192];
+    uint64_t *keys = (uint64_t *)malloc(inserted * sizeof(uint64_t));
     size_t i;
 
+    assert(keys != NULL);
     tc.kind = kind; tc.concurrent = 0; tc.resize_mode = resize_mode; tc.value_size = value_size;
-    o.bin_size = 1; /* one entry per dereference bin */
     t = tpht_test_make_kind(kind, 0, resize_mode, capacity, value_size, &o);
     assert(t.handle != NULL);
     bytes_before = t.memory_bytes(t.handle);
 
-    for (i = 0; i < capacity; ++i) {
+    for (i = 0; i < inserted; ++i) {
         keys[i] = tpht_test_trunc_to(tpht_test_next_rand(&rng), tpht_test_key_size(kind));
         assert(t.put(t.handle, keys[i], i) == TPHT_OK);
     }
-    for (i = 0; i < capacity; ++i) tpht_test_assert_get(&t, &tc, keys[i], i);
+    /* Every key survives however many times the table rebuilt underneath it. */
+    for (i = 0; i < inserted; ++i) tpht_test_assert_get(&t, &tc, keys[i], i);
+    /* Absorbing that many entries cannot have happened without growing. */
     assert(t.memory_bytes(t.handle) > bytes_before);
     if (resize_mode == TPHT_FIXED) assert(t.capacity(t.handle) == capacity);
+    free(keys);
     t.destroy(t.handle);
 }
 
@@ -202,12 +221,10 @@ void tpht_test_run_config_module(void) {
     tpht_options_t o = tpht_default_options();
     flatten_tpht64_t *t;
 
-    /* Values are 1 to 8 bytes; bins hold at most 127 entries. */
+    /* Values are 1 to 8 bytes. */
     o.value_size = 9;
     assert(flatten_tpht64_create(1024, &o) == NULL);
-    o = tpht_default_options();
-    o.bin_size = 128;
-    assert(flatten_tpht64_create(1024, &o) == NULL);
+
 
     /* Zero capacity still yields a usable table. */
     o = tpht_default_options();

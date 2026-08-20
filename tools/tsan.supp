@@ -1,0 +1,24 @@
+# ThreadSanitizer suppressions for TPHT's by-design benign races.
+#
+# Run with:
+#   gcc -O1 -g -fsanitize=thread -I. <harness>.c tpht.c -pthread -o <bin>
+#   setarch $(uname -m) -R env TSAN_OPTIONS="suppressions=tools/tsan.supp" ./<bin>
+# (setarch -R works around TSan's "unexpected memory mapping" on kernels with
+# high mmap ASLR entropy.)
+#
+# Anything TSan reports beyond these is a finding worth reading.  Everything
+# else the library does - geometry access, resize state, size counting - is
+# either properly atomic or routed through the immutable geo_snap snapshot,
+# and TSan agrees.
+#
+# Seqlock data words: lock-free readers deliberately read block bytes and pool
+# payloads while a writer may be mid-edit; the per-block version
+# (tpht_flat_read_begin/read_valid, tpht_chain_read_begin/read_valid) discards
+# every torn read.  Formally a C11 data race, functionally the seqlock
+# pattern.
+race:tpht_flat_get_raw
+race:tpht_flat_insert_soft
+race:tpht_flat_insert_raw
+race:tpht_flat_remove_raw
+race:tpht_chained_get_fine_word
+race:tpht_chained_get_at_bounded

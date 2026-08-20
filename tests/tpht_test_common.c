@@ -45,7 +45,42 @@ static size_t chained_tpht64_a_capacity(const void *h) { return chained_tpht64_c
 static size_t chained_tpht64_a_memory(const void *h) { return chained_tpht64_memory_bytes((const chained_tpht64_t *)h); }
 static void chained_tpht64_a_destroy(void *h) { chained_tpht64_destroy((chained_tpht64_t *)h); }
 
-static void bind(tpht_test_table_t *t, tpht_test_kind_t kind) {
+/* Concurrent flattened tables: same operations, distinct entry points. */
+static tpht_status_t fconc32_a_put(void *h, uint64_t k, uint64_t v) { return flatten_conc_tpht32_put((flatten_conc_tpht32_t *)h, (uint32_t)k, v); }
+static tpht_status_t fconc32_a_insert(void *h, uint64_t k, uint64_t v) { return flatten_conc_tpht32_insert((flatten_conc_tpht32_t *)h, (uint32_t)k, v); }
+static tpht_status_t fconc32_a_update(void *h, uint64_t k, uint64_t v) { return flatten_conc_tpht32_update((flatten_conc_tpht32_t *)h, (uint32_t)k, v); }
+static tpht_status_t fconc32_a_get(void *h, uint64_t k, uint64_t *v) { return flatten_conc_tpht32_get((flatten_conc_tpht32_t *)h, (uint32_t)k, v); }
+static tpht_status_t fconc32_a_remove(void *h, uint64_t k) { return flatten_conc_tpht32_remove((flatten_conc_tpht32_t *)h, (uint32_t)k); }
+static size_t fconc32_a_size(const void *h) { return flatten_conc_tpht32_size((const flatten_conc_tpht32_t *)h); }
+static size_t fconc32_a_capacity(const void *h) { return flatten_conc_tpht32_capacity((const flatten_conc_tpht32_t *)h); }
+static size_t fconc32_a_memory(const void *h) { return flatten_conc_tpht32_memory_bytes((const flatten_conc_tpht32_t *)h); }
+static void fconc32_a_destroy(void *h) { flatten_conc_tpht32_destroy((flatten_conc_tpht32_t *)h); }
+
+static tpht_status_t fconc64_a_put(void *h, uint64_t k, uint64_t v) { return flatten_conc_tpht64_put((flatten_conc_tpht64_t *)h, k, v); }
+static tpht_status_t fconc64_a_insert(void *h, uint64_t k, uint64_t v) { return flatten_conc_tpht64_insert((flatten_conc_tpht64_t *)h, k, v); }
+static tpht_status_t fconc64_a_update(void *h, uint64_t k, uint64_t v) { return flatten_conc_tpht64_update((flatten_conc_tpht64_t *)h, k, v); }
+static tpht_status_t fconc64_a_get(void *h, uint64_t k, uint64_t *v) { return flatten_conc_tpht64_get((flatten_conc_tpht64_t *)h, k, v); }
+static tpht_status_t fconc64_a_remove(void *h, uint64_t k) { return flatten_conc_tpht64_remove((flatten_conc_tpht64_t *)h, k); }
+static size_t fconc64_a_size(const void *h) { return flatten_conc_tpht64_size((const flatten_conc_tpht64_t *)h); }
+static size_t fconc64_a_capacity(const void *h) { return flatten_conc_tpht64_capacity((const flatten_conc_tpht64_t *)h); }
+static size_t fconc64_a_memory(const void *h) { return flatten_conc_tpht64_memory_bytes((const flatten_conc_tpht64_t *)h); }
+static void fconc64_a_destroy(void *h) { flatten_conc_tpht64_destroy((flatten_conc_tpht64_t *)h); }
+
+static void bind(tpht_test_table_t *t, tpht_test_kind_t kind, int concurrent) {
+    if (concurrent && kind == TPHT_TEST_FLAT32) {
+        t->put = fconc32_a_put; t->insert = fconc32_a_insert; t->update = fconc32_a_update;
+        t->get = fconc32_a_get; t->remove = fconc32_a_remove; t->size = fconc32_a_size;
+        t->capacity = fconc32_a_capacity; t->memory_bytes = fconc32_a_memory;
+        t->destroy = fconc32_a_destroy;
+        return;
+    }
+    if (concurrent && kind == TPHT_TEST_FLAT64) {
+        t->put = fconc64_a_put; t->insert = fconc64_a_insert; t->update = fconc64_a_update;
+        t->get = fconc64_a_get; t->remove = fconc64_a_remove; t->size = fconc64_a_size;
+        t->capacity = fconc64_a_capacity; t->memory_bytes = fconc64_a_memory;
+        t->destroy = fconc64_a_destroy;
+        return;
+    }
     switch (kind) {
         case TPHT_TEST_FLAT32:
             t->put = flatten_tpht32_a_put; t->insert = flatten_tpht32_a_insert; t->update = flatten_tpht32_a_update;
@@ -88,10 +123,6 @@ const char *tpht_test_kind_name(tpht_test_kind_t kind) {
     }
 }
 
-static int is_flatten(tpht_test_kind_t kind) {
-    return kind == TPHT_TEST_FLAT32 || kind == TPHT_TEST_FLAT64;
-}
-
 uint64_t tpht_test_mask_for_size(uint8_t size) {
     return size >= 8u ? UINT64_MAX : ((UINT64_C(1) << (8u * size)) - 1u);
 }
@@ -115,8 +146,7 @@ size_t tpht_test_model_find(tpht_test_model_entry_t *model, size_t n, uint64_t k
 
 int tpht_test_case_supported(const tpht_test_case_t *tc) {
     if (tc->value_size == 0u || tc->value_size > 8u) return 0;
-    /* The flattened variant is sequential only. */
-    return !(is_flatten(tc->kind) && tc->concurrent);
+    return 1; /* every variant/threading/mode combination is supported now */
 }
 
 tpht_test_table_t tpht_test_make_kind(tpht_test_kind_t kind, int concurrent,
@@ -127,10 +157,16 @@ tpht_test_table_t tpht_test_make_kind(tpht_test_kind_t kind, int concurrent,
     memset(&t, 0, sizeof(t));
     o.resize_mode = mode;
     o.value_size = value_size;
-    bind(&t, kind);
+    bind(&t, kind, concurrent);
     switch (kind) {
-        case TPHT_TEST_FLAT32: t.handle = flatten_tpht32_create(capacity, &o); break;
-        case TPHT_TEST_FLAT64: t.handle = flatten_tpht64_create(capacity, &o); break;
+        case TPHT_TEST_FLAT32:
+            t.handle = concurrent ? (void *)flatten_conc_tpht32_create(capacity, &o)
+                                  : (void *)flatten_tpht32_create(capacity, &o);
+            break;
+        case TPHT_TEST_FLAT64:
+            t.handle = concurrent ? (void *)flatten_conc_tpht64_create(capacity, &o)
+                                  : (void *)flatten_tpht64_create(capacity, &o);
+            break;
         case TPHT_TEST_CHAIN32: t.handle = chained_tpht32_create(capacity, concurrent, &o); break;
         default: t.handle = chained_tpht64_create(capacity, concurrent, &o); break;
     }
