@@ -517,7 +517,7 @@ static TPHT_THREAD_LOCAL unsigned tpht_tls_shard_salt;
  * threads; doing that per insert would put the cross-core traffic right back.
  * Checking every 64th write bounds the overshoot past the limit to
  * 64 * threads entries, absorbed by the load-factor slack below the storage's
- * hard bound - and a hard overflow in the gap still trips the TPHT_FULL arm,
+ * hard bound - and a hard overflow in the gap still trips the TPHT_OVERFLOW arm,
  * which resizes regardless of what the counter says.
  */
 #define TPHT_SIZE_CHECK_PERIOD 64u
@@ -1767,7 +1767,7 @@ TPHT_HOT tpht_status_t tpht_chained_insert_raw(tpht_table_t *t, const void *key,
     }
 
     entry = tpht_pool_alloc(t, (uint64_t)(uintptr_t)prev, &encoded, t->key_size);
-    if (!entry) return TPHT_FULL;
+    if (!entry) return TPHT_OVERFLOW;
     *prev = encoded;
     entry[0] = 0;
 #if TPHT_LITTLE_ENDIAN
@@ -2465,7 +2465,7 @@ TPHT_NOINLINE static tpht_status_t tpht_flat_insert_soft(tpht_table_t *t, uint8_
                 while (i-- > 0u) tpht_pool_free(t, encoded[i], entries[i]);
                 /* Hard overflow: the dereference table is exhausted. */
                 atomic_store_explicit(&t->flat_deref_pressure, 1u, memory_order_relaxed);
-                return TPHT_FULL;
+                return TPHT_OVERFLOW;
             }
         }
 
@@ -2616,7 +2616,7 @@ TPHT_HOT tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, uint64_t key, uint6
     if (TPHT_UNLIKELY(count >= TPHT_FLAT_MAX_TUPLES)) {
         atomic_store_explicit(&t->flat_deref_pressure, 0u, memory_order_relaxed);
         tpht_flat_write_end(line, concurrent);
-        return TPHT_FULL;
+        return TPHT_OVERFLOW;
     }
 
     crystals = tpht_flat_meta_crystals(meta);
@@ -2891,9 +2891,9 @@ static tpht_status_t tpht_flat_rebuild(tpht_table_t *t, size_t new_capacity,
             return TPHT_OK;
         }
         tpht_free_storage(&nt);
-        if (st != TPHT_FULL) return st;
+        if (st != TPHT_OVERFLOW) return st;
     }
-    return TPHT_FULL;
+    return TPHT_OVERFLOW;
 }
 
 /*
@@ -2937,19 +2937,19 @@ TPHT_NOINLINE static tpht_status_t tpht_flat_write_slow(tpht_table_t *t, uint64_
     if (at_capacity) {
         /*
          * insert is append-only: at capacity there is no room for another
-         * entry, so it reports TPHT_FULL without probing.  Only an overwrite
+         * entry, so it reports TPHT_OVERFLOW without probing.  Only an overwrite
          * (replace != 0) may still look the key up and touch it in place.
          */
-        if (!replace) return TPHT_FULL;
+        if (!replace) return TPHT_OVERFLOW;
         uint64_t scratch;
         st = tpht_flat_get_raw(t, key, &scratch, key_bytes, concurrent);
-        if (st != TPHT_OK) return TPHT_FULL;
+        if (st != TPHT_OK) return TPHT_OVERFLOW;
     } else {
         st = tpht_flat_resize(t, t->capacity * 2u, key_bytes);
         if (st != TPHT_OK) return st;
     }
     st = tpht_flat_insert_raw(t, key, value, replace, key_bytes, concurrent);
-    if (st == TPHT_FULL)
+    if (st == TPHT_OVERFLOW)
         st = tpht_flat_write_grow(t, key, value, replace, key_bytes, concurrent);
     return st;
 }
@@ -2961,7 +2961,7 @@ TPHT_NOINLINE static tpht_status_t tpht_flat_write_grow(tpht_table_t *t, uint64_
      * Hard overflow: rebuild with more blocks and retry - in a bounded loop,
      * because a successful rebuild can still leave THIS key's new home block
      * saturated (dense tables re-deal every block's load), and a single
-     * retry then reported a transient TPHT_FULL that one more grow would
+     * retry then reported a transient TPHT_OVERFLOW that one more grow would
      * have absorbed.  The bound matters: a block saturated by duplicates of
      * one key never splits however many blocks a rebuild adds, so without it
      * every round would succeed, double the block count, and fail the insert
@@ -2972,9 +2972,9 @@ TPHT_NOINLINE static tpht_status_t tpht_flat_write_grow(tpht_table_t *t, uint64_
         tpht_status_t st = tpht_flat_grow(t, key_bytes);
         if (st != TPHT_OK) return st;
         st = tpht_flat_insert_raw(t, key, value, replace, key_bytes, concurrent);
-        if (st != TPHT_FULL) return st;
+        if (st != TPHT_OVERFLOW) return st;
     }
-    return TPHT_FULL;
+    return TPHT_OVERFLOW;
 }
 
 TPHT_HOT tpht_status_t tpht_flat_write(tpht_table_t *t, uint64_t key, uint64_t value, int replace,
@@ -3020,7 +3020,7 @@ TPHT_HOT tpht_status_t tpht_flat_write(tpht_table_t *t, uint64_t key, uint64_t v
             }
             st = tpht_flat_insert_raw(t, key, value, replace, key_bytes, concurrent);
             if (TPHT_UNLIKELY(st == TPHT_RETRY)) continue; /* raced a commit */
-            if (TPHT_UNLIKELY(st == TPHT_FULL)) {
+            if (TPHT_UNLIKELY(st == TPHT_OVERFLOW)) {
                 if (tpht_flat_resize_active(t)) {
                     /* The block cannot take another tuple until the running
                      * resize lands; finishing it is the fastest way there. */
@@ -3042,7 +3042,7 @@ TPHT_HOT tpht_status_t tpht_flat_write(tpht_table_t *t, uint64_t key, uint64_t v
                  * 65536x the blocks - beyond any overload growth can absorb.
                  * What remains full past that is a block that growth cannot
                  * split, i.e. TPHT_FLAT_MAX_TUPLES-bounded duplicates of one
-                 * key (see tpht.h), and the honest answer is TPHT_FULL, not
+                 * key (see tpht.h), and the honest answer is TPHT_OVERFLOW, not
                  * an allocation march into TPHT_NO_MEMORY. */
                 {
                     tpht_table_t *gl = atomic_load_explicit(&t->geo_snap, memory_order_acquire);
@@ -3061,14 +3061,14 @@ TPHT_HOT tpht_status_t tpht_flat_write(tpht_table_t *t, uint64_t key, uint64_t v
                      * would migrate the whole table and change nothing.  The
                      * per-block tuple ceiling is then structural, exactly as
                      * the sequential rebuild's same-geometry check concludes,
-                     * and the honest answer is TPHT_FULL now, not after
+                     * and the honest answer is TPHT_OVERFLOW now, not after
                      * sixteen futile full-table migrations.
                      */
                     if (TPHT_UNLIKELY((unsigned)gl->flat_cloud_bits + TPHT_FLAT_FP_BITS >=
                                       t->key_bits))
-                        return TPHT_FULL;
+                        return TPHT_OVERFLOW;
                     if (TPHT_UNLIKELY(gl->flat_growth >= 16u || ++full_rounds > 64u))
-                        return TPHT_FULL;
+                        return TPHT_OVERFLOW;
                     if (!tpht_flat_conc_resize_start(t, gl->capacity,
                                                      (uint32_t)gl->flat_growth + 1u, fl, 1))
                         return TPHT_NO_MEMORY;
@@ -3084,7 +3084,7 @@ TPHT_HOT tpht_status_t tpht_flat_write(tpht_table_t *t, uint64_t key, uint64_t v
                                     t->cfg.resize_mode == TPHT_FIXED, concurrent);
 
     st = tpht_flat_insert_raw(t, key, value, replace, key_bytes, concurrent);
-    if (TPHT_UNLIKELY(st == TPHT_FULL)) {
+    if (TPHT_UNLIKELY(st == TPHT_OVERFLOW)) {
         /*
          * A rebuild replaces every block and the whole dereference table, which
          * cannot be done underneath readers that hold no lock.  A concurrent
@@ -3092,7 +3092,7 @@ TPHT_HOT tpht_status_t tpht_flat_write(tpht_table_t *t, uint64_t key, uint64_t v
          * documentation says; only a sequential one grows here.  `concurrent`
          * is a literal at every call site, so one arm or the other disappears.
          */
-        if (concurrent) return TPHT_FULL;
+        if (concurrent) return TPHT_OVERFLOW;
         return tpht_flat_write_grow(t, key, value, replace, key_bytes, concurrent);
     }
     return st;
@@ -3145,7 +3145,7 @@ TPHT_HOT tpht_status_t tpht_chained_insert_word(tpht_table_t *t, uint64_t key, u
     }
 
     entry = tpht_pool_alloc(t, (uint64_t)(uintptr_t)prev, &encoded, t->key_size);
-    if (!entry) return TPHT_FULL;
+    if (!entry) return TPHT_OVERFLOW;
     *prev = encoded;
     entry[0] = 0;
 #if TPHT_LITTLE_ENDIAN
@@ -3240,11 +3240,11 @@ static tpht_status_t tpht_chained_write_locked(tpht_table_t *t, uint64_t key, ui
      * table's privilege, and that is decided by write_limit.  A loop, not a
      * single retry: a table overloaded far past its provisioned capacity may
      * need several doublings before the dereference table can take one more
-     * entry, and reporting TPHT_FULL in between would break the contract that
+     * entry, and reporting TPHT_OVERFLOW in between would break the contract that
      * fullness alone is never reported.  Each round doubles the capacity, so
      * it terminates - in the worst case at TPHT_NO_MEMORY.
      */
-    while (TPHT_UNLIKELY(st == TPHT_FULL)) {
+    while (TPHT_UNLIKELY(st == TPHT_OVERFLOW)) {
         st = tpht_resize_locked(t, t->capacity * 2u);
         if (st != TPHT_OK) return st;
         st = tpht_chained_raw_insert(t, key, value, replace);
@@ -4030,7 +4030,7 @@ static tpht_status_t tpht_chained_resizable_write_fine(tpht_table_t *t, uint64_t
             }
         }
         st = tpht_chained_write_fine(t, key_word, value_word, replace);
-        if (TPHT_UNLIKELY(st == TPHT_FULL)) {
+        if (TPHT_UNLIKELY(st == TPHT_OVERFLOW)) {
             if (tpht_chained_resize_active(t)) {
                 tpht_chained_resize_finish_all(t);
                 continue;
@@ -4146,7 +4146,7 @@ retry:
 
     /*
      * A resizable table counts the entry before allocating it; the hard bound
-     * is the pool itself, whose failed allocation below reports TPHT_FULL and
+     * is the pool itself, whose failed allocation below reports TPHT_OVERFLOW and
      * gives the count back.  The old compare-and-swap reservation against
      * capacity added a contended read-modify-write per insert to enforce a
      * bound the storage already enforces.
@@ -4157,7 +4157,7 @@ retry:
     if (!entry) {
         if (t->tracks_size) tpht_size_dec(t); /* give the reservation back. */
         tpht_chain_lock_release(lk);
-        return TPHT_FULL;
+        return TPHT_OVERFLOW;
     }
 
     *prev = encoded;
@@ -4288,7 +4288,7 @@ static tpht_status_t tpht_resize_locked(tpht_table_t *t, size_t new_capacity) {
             st = tpht_chained_insert_raw(&nt, rebuilt_key, entry + 1u + t->key_quotient_size, 0);
             if (st != TPHT_OK) {
                 tpht_free_storage(&nt);
-                return st == TPHT_FULL ? TPHT_NO_MEMORY : st;
+                return st == TPHT_OVERFLOW ? TPHT_NO_MEMORY : st;
             }
             prev = entry;
         }
@@ -4505,7 +4505,7 @@ TPHT_NOINLINE static tpht_status_t tpht_chained_fixed_write_fine(tpht_table_t *t
     tpht_status_t st;
     for (;;) {
         st = tpht_chained_write_fine(t, key_word, value_word, replace);
-        if (TPHT_LIKELY(st != TPHT_FULL)) return st;
+        if (TPHT_LIKELY(st != TPHT_OVERFLOW)) return st;
         if (tpht_chained_resize_active(t)) {
             tpht_chained_resize_finish_all(t);
             continue;
@@ -4521,7 +4521,7 @@ TPHT_HOT tpht_status_t tpht_chained_conc_write(tpht_table_t *t, uint64_t key, ui
     key &= t->key_mask;
     if (resizable) return tpht_chained_resizable_write_fine(t, key, value, replace);
     st = tpht_chained_write_fine(t, key, value, replace);
-    if (TPHT_UNLIKELY(st == TPHT_FULL))
+    if (TPHT_UNLIKELY(st == TPHT_OVERFLOW))
         st = tpht_chained_fixed_write_fine(t, key, value, replace);
     return st;
 }
@@ -4613,7 +4613,7 @@ size_t flatten_tpht32_memory_bytes(const flatten_tpht32_t *table) { return tpht_
  * concurrent flag, so each block is taken through its seqlock and the
  * dereference bins through their locks.  A concurrent flattened table has a
  * fixed geometry: it cannot rebuild itself underneath live readers, so a hard
- * overflow is reported as TPHT_FULL instead of being absorbed.
+ * overflow is reported as TPHT_OVERFLOW instead of being absorbed.
  */
 flatten_conc_tpht32_t *flatten_conc_tpht32_create(size_t capacity, const tpht_options_t *options) {
     return (flatten_conc_tpht32_t *)tpht_create_internal(TPHT_FLATTEN, TPHT_CONCURRENT, 4, capacity,

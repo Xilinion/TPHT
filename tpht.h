@@ -39,7 +39,7 @@ typedef enum tpht_status {
     TPHT_NOT_FOUND = 1,
     /* Structural fullness only - no growth can absorb the write (see the
      * insert and flatten notes below).  Ordinary fullness grows instead. */
-    TPHT_FULL = 2,
+    TPHT_OVERFLOW = 2,
     TPHT_NO_MEMORY = 3
 } tpht_status_t;
 
@@ -61,7 +61,7 @@ typedef enum tpht_status {
  *           Insert).  Fastest write; callers that need uniqueness use put/update.
  *           Flattened tables bound the copies of any single key: they all live
  *           in one 64-byte home block whatever the table size, so past ~30
- *           duplicates insert reports TPHT_FULL.  Chained tables stack
+ *           duplicates insert reports TPHT_OVERFLOW.  Chained tables stack
  *           duplicates without that bound.
  *   put     upsert: overwrite the value if the key exists, else append it.
  *   update  overwrite-only: return TPHT_NOT_FOUND if the key is absent.
@@ -77,7 +77,7 @@ typedef enum tpht_status {
  *                   provisions the storage rather than capping it, so a write
  *                   past capacity is not refused.  A hard overflow is still
  *                   absorbed by rebuilding larger, exactly as for a resizable
- *                   table, so writes do not report TPHT_FULL for fullness
+ *                   table, so writes do not report TPHT_OVERFLOW for fullness
  *                   alone - only TPHT_NO_MEMORY if that rebuild cannot be
  *                   allocated.  This is what makes a fixed table's writes the
  *                   cheaper of the two; the cost lands on *_size(), which
@@ -148,7 +148,7 @@ typedef struct chained_conc_tpht64 chained_conc_tpht64_t;
  * The sequential flattened tables.  A hard overflow - a home block that cannot
  * address another tuple, or an exhausted dereference table - is absorbed by
  * rebuilding with more blocks.  Only an overflow that no growth can split
- * still reports TPHT_FULL: duplicates of one key share a home block whatever
+ * still reports TPHT_OVERFLOW: duplicates of one key share a home block whatever
  * the block count (see insert above), and a 32-bit-key table's block count is
  * pinned by the key width itself (blocks x fingerprints cannot outnumber the
  * keys), which caps a flatten_*32 table around the hundred-million-entry mark

@@ -28,7 +28,7 @@ static void run_api_edges_case(const tpht_test_case_t *tc) {
         }
         /* A fixed table keeps no running size: capacity provisions its storage
          * but is not a hard cap, so an insert past it absorbs the overflow by
-         * rebuilding with more blocks rather than reporting TPHT_FULL. */
+         * rebuilding with more blocks rather than reporting TPHT_OVERFLOW. */
         assert(t.insert(t.handle, 999999u, 1u) == TPHT_OK);
         tpht_test_assert_get(&t, tc, 999999u, 1u);
         /* An overwrite of a key already present still succeeds. */
@@ -46,6 +46,35 @@ static void run_api_edges_case(const tpht_test_case_t *tc) {
     t.destroy(t.handle);
 }
 
+/* Tiny capacities, including 1: fill to the requested capacity, verify,
+ * drain, refill.  Small tables exercise the minimum-geometry paths that big
+ * ones never touch. */
+static void run_tiny_capacity_case(const tpht_test_case_t *tc) {
+    static const size_t caps[] = {1, 2, 3, 5, 8, 16};
+    size_t ci;
+
+    for (ci = 0; ci < sizeof(caps) / sizeof(caps[0]); ++ci) {
+        tpht_test_table_t t = tpht_test_make_table(tc, caps[ci]);
+        uint64_t k;
+
+        assert(t.handle != NULL);
+        for (k = 1; k <= (uint64_t)caps[ci]; ++k)
+            assert(t.insert(t.handle, k, k * 3u) == TPHT_OK);
+        for (k = 1; k <= (uint64_t)caps[ci]; ++k)
+            tpht_test_assert_get(&t, tc, k, k * 3u);
+        for (k = 1; k <= (uint64_t)caps[ci]; ++k)
+            assert(t.remove(t.handle, k) == TPHT_OK);
+        for (k = 1; k <= (uint64_t)caps[ci]; ++k)
+            tpht_test_assert_missing(&t, k);
+        for (k = 1; k <= (uint64_t)caps[ci]; ++k)
+            assert(t.insert(t.handle, k, k * 3u) == TPHT_OK);
+        for (k = 1; k <= (uint64_t)caps[ci]; ++k)
+            tpht_test_assert_get(&t, tc, k, k * 3u);
+        t.destroy(t.handle);
+    }
+}
+
 void tpht_test_run_api_edges_module(void) {
     tpht_test_for_each_case(run_api_edges_case);
+    tpht_test_for_each_case(run_tiny_capacity_case);
 }

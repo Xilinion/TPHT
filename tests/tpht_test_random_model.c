@@ -25,7 +25,7 @@ static void run_random_model_case(const tpht_test_case_t *tc) {
 
         if (action <= 1) {
             tpht_status_t st = t.put(t.handle, key, val);
-            assert(st == TPHT_OK || (tc->resize_mode == TPHT_FIXED && st == TPHT_FULL));
+            assert(st == TPHT_OK || (tc->resize_mode == TPHT_FIXED && st == TPHT_OVERFLOW));
             if (st == TPHT_OK) {
                 if (idx == MODEL_CAP) {
                     size_t i;

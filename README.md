@@ -1,41 +1,20 @@
 # TPHT
 
-> **Development status: experimental / under active development.**
->
-> TPHT is currently being rewritten and validated. APIs, internal layouts,
-> concurrency behavior, and benchmark results may still change. At this stage,
-> correctness is **not guaranteed**, and performance is even less so. Do **not**
-> treat this repository as production-stable yet. The current target for a
-> stabilized implementation is around late August.
+Industrial C implementation of **Tiny Pointer Hash Tables**, from the paper:
 
-Industrial C implementation of Tiny Pointer Hash Tables.  This repository keeps only the two intended variants from the academic TinyPtr codebase:
+> Xilin Tang, Yuqi Mai, William Kuszmaul, Alex Conway.
+> **Succinct and Fast Tiny Pointer Hash Tables.**
+> Proceedings of the VLDB Endowment (PVLDB) 19(9), 2026.
+> [doi:10.14778/3819518.3819542](https://dl.acm.org/doi/10.14778/3819518.3819542) ·
+> [arXiv:2607.28892](https://arxiv.org/abs/2607.28892)
 
-- `chained-tpht`: derived from the `byte_array_chained_ht` idea.
-- `flatten-tpht`: derived from the `blast_ht` idea, with 64-byte home blocks, inline fingerprints, and tiny pointers to overflow entries.
+Two variants: `chained-tpht` (tiny-pointer chains, tuned for space) and
+`flatten-tpht` (64-byte home blocks, tuned for latency).  To use it, copy
+`tpht.h` and `tpht.c` into your project — C11 and the standard library are the
+only requirements.
 
-The code is designed to be copied directly into another project: copy `tpht.h` and `tpht.c`.
-
-This is an independent implementation, not a wrapper around the academic
-TinyPtr source. It neither includes nor links TinyPtr. The library itself needs
-only a C11 compiler and the C standard library; its XXH3 word-hashing path is
-embedded in `tpht.c`. The benchmark runners likewise compile directly from this
-repository and produce CSV results without third-party libraries. Python and
-Matplotlib are optional and are used only to turn latency CSV output into a PDF.
-
-## Features
-
-- C11 implementation, no C++ dependency.
-- **Four concrete types, one per (variant, key width).** Nothing about a table is
-  decided at run time: an operation never tests a configuration field before
-  doing its work.
-- Values are any size from 1 to 8 bytes, chosen per table.
-- Chained variant: sequential and concurrent, fixed-capacity and resizable.
-- Flattened variant: sequential only for now, fixed-capacity or resizable.
-- Resizing uses normal capacity doubling.
-- XXH3 hashing, embedded directly for copy-paste portability, with a separate
-  function per key width and both swappable by macro.
-- SIMD optimized fingerprint matching for `flatten-tpht` when available.
-- Safe scalar fallback when SIMD is disabled or unavailable.
+> **Status:** well-tested pre-release, under active development; the API may
+> still move.
 
 ## Quick start
 
@@ -57,231 +36,97 @@ int main(void) {
 }
 ```
 
-Compile:
-
 ```sh
 cc -std=c11 -O2 -I. tpht.c your_file.c -o your_program
 ```
 
-## The four types
+## The eight types
 
 ```
-flatten_tpht32_t   flatten_tpht64_t     64-byte home blocks, no chaining
-chained_tpht32_t   chained_tpht64_t     tiny-pointer chains
+flatten_tpht32_t        flatten_tpht64_t         sequential flattened
+flatten_conc_tpht32_t   flatten_conc_tpht64_t    concurrent flattened
+chained_tpht32_t        chained_tpht64_t         sequential chained
+chained_conc_tpht32_t   chained_conc_tpht64_t    concurrent chained
 ```
 
-Each carries its own constructors and operations, named after the type:
+One type per (variant, key width, threading), so every code path is fixed at
+compile time — no configuration test on any hot path.  All eight come from the
+one `tpht.c` and can be mixed freely in one program.  Each type carries its own
+constructors and operations:
 
 ```c
 flatten_tpht64_fixed_create(capacity, value_size);
 flatten_tpht64_resizable_create(capacity, value_size);
 flatten_tpht64_put / _insert / _update / _get / _remove / _destroy
 flatten_tpht64_size / _capacity / _memory_bytes
-
-chained_tpht32_fixed_create(capacity, value_size);
-chained_tpht32_resizable_create(capacity, value_size);
-chained_tpht32_concurrent_fixed_create(capacity, value_size);
-chained_tpht32_concurrent_resizable_create(capacity, value_size);
 ```
 
 Keys are `uint32_t` or `uint64_t` by type.  Values cross the API as `uint64_t`
-and are truncated to the table's value size, so a table with a 3-byte value
-stores and returns values modulo 2^24.
-
-The point of the split is that the variant and the key width are known at
-compile time, so the hash, the key mask and the code path are all fixed before
-the call: there is no `if (table->key_size == 4)` on any hot path.  Measured
-against the previous run-time-configured build, a 1M-key lookup went from
-59.7 ns to 41.6 ns.
-
-## Options
-
-Every family also takes an options struct for the rest of the knobs.  A zero in
-any field selects that field's default.
+and are truncated to the table's value size (1 to 8 bytes, chosen per table).
+The remaining knobs live in an options struct, where zero means default:
 
 ```c
 tpht_options_t o = tpht_default_options();
-o.resize_mode = TPHT_RESIZABLE;
-o.value_size = 5;
-o.max_load_factor = 0.9;
-o.hash_seed = 0x1234;
-
-flatten_tpht64_t *t = flatten_tpht64_create(1 << 20, &o);
-chained_tpht64_t *c = chained_tpht64_create(1 << 20, /*concurrent=*/1, &o);
+o.resize_mode = TPHT_RESIZABLE;      /* also: value_size, max_load_factor, hash_seed */
+flatten_conc_tpht64_t *t = flatten_conc_tpht64_create(1 << 20, &o);
 ```
 
-Concurrency is not implemented for the flattened variant, so
-`flatten_*` has no concurrent constructor.
+## What to expect
 
-## Flattened layout
+- **A table never fills up on you.**  Both fixed and resizable tables absorb
+  overflow by growing internally; a write fails only on allocation failure or
+  a structural ceiling (status-code details in
+  [docs/INTERNALS.md](docs/INTERNALS.md)).
+- **`insert` appends duplicates**; `put`/`update` overwrite.  In the flattened
+  variant ~30 duplicates of one single key is a structural ceiling, and the
+  32-bit flattened types top out near 190M entries because quotienting
+  consumes all 32 key bits — use the 64-bit types beyond that.
+- **Concurrent tables** are safe for any mix of operations from any number of
+  threads and resize online: readers never block, writers lock one 64-byte
+  block and pay at most a bounded slice of migration work.
 
-Each quotient group owns exactly one 64-byte home block, so a lookup reads one
-cache line and, at most, one more for an overflow entry.  There is no chaining.
+## SIMD
 
-```
-byte 0 ........................................................ byte 63
-[ fingerprints -> ] [ free ] [ <- tiny pointers ][ <- crystals ][ctl][ver]
-```
+Fingerprint screening is the flattened variant's hot loop, and SIMD matters a
+lot there: with vectorized screening (picked automatically — AVX2, SSE2, or
+NEON, at runtime where possible) lookups run about **2× faster** than the
+scalar fallback.  Measured with the stock latency benchmark, 4M keys at load
+0.85, medians of alternating runs on a pinned core:
 
-- **Fingerprints** grow up from offset 0, one byte per tuple stored in *or via*
-  this block, home tuples first and overflow tuples after.  One SIMD compare
-  screens all of them at once.
-- **Crystals** are whole quotiented key/value entries stored in the line itself
-  and grow down from the control byte.
-- **Tiny pointers** are one byte each, address the dereference table, and grow
-  down from the bottom of the crystal region.
-- **Control byte** holds the number of tuples in the block, 0 to 31, in its low
-  5 bits.  How many of them are crystals follows from that count and the entry
-  size, because a block always keeps as many tuples inline as its remaining
-  space allows, so it does not have to be stored.  TinyPtr instead splits this
-  byte into a 3-bit crystal count and a 5-bit tiny pointer count, which caps
-  inline tuples at 7 even when many more would fit - with 4-byte keys and 1-byte
-  values a block has room for 20.
-- **Version byte** is a seqlock counter, kept from the TinyPtr layout so the
-  block is ready for concurrent readers; the sequential code bumps it around
-  every mutation.
+| flatten op   | scalar | SIMD (AVX2) | speedup |
+|--------------|-------:|------------:|--------:|
+| lookup hit   | 57.9 ns |    25.4 ns | 2.3× |
+| lookup miss  | 42.9 ns |    21.7 ns | 2.0× |
+| remove       | 97.9 ns |    87.7 ns | 1.1× |
+| insert       | 25.6 ns |    25.7 ns | 1.0× |
 
-Keys are quotiented with a one-round Feistel permutation over
-`block_bits + 8` bits: the low bits index the home block and the extra byte
-*is* the fingerprint, so neither has to be stored.  Only the remaining key
-remainder and the value live in an entry, which is therefore
-`ceil((key_bits - block_bits - 8) / 8) + value_size` bytes.
+Nothing to configure: the default build does the right thing.  If your
+toolchain or target cannot use SIMD, `-DTPHT_ENABLE_SIMD=0` forces the scalar
+fallback — correct, just slower to look up.  Forced instruction-set builds for
+testing are described in [docs/INTERNALS.md](docs/INTERNALS.md).
 
-Because the crystal count is a function of the tuple count, insertion reduces to
-comparing `crystals(x)` with `crystals(x + 1)`:
-
-- `crystals(x+1) == crystals(x) + 1` - the pair itself fits in the line.
-- otherwise - a **soft overflow**: the new tuple, along with any inline tuple the
-  block can no longer afford, migrates to the dereference table and is addressed
-  by a tiny pointer.  This is the paper's eviction case, generalised to evict as
-  many tuples as the arithmetic calls for.
-
-Deletion is the inverse and promotes overflow tuples back into the line whenever
-whole entries fit again.
-
-### Overflow handling
-
-A **hard overflow** is a structural failure rather than a full table: either a
-home block cannot address another tuple at all (31 of them, the counter's
-limit), or the dereference table cannot hand out an entry.  Both are absorbed
-automatically - the table is rebuilt with twice the home blocks and the write is
-retried - so neither is ever reported to the caller.  This happens whether or
-not the table was created resizable; a fixed table keeps the capacity it was
-given and only its internal geometry grows.  All the dereference entries a write
-needs are reserved before the home block is touched, so a hard overflow leaves
-the block exactly as it was.
-
-**Sizing.** The target number of keys per block is however many entries fit in
-a line before anything spills: 4 for 8-byte keys and values, which is the
-paper's figure, and up to 20 for the smallest entries.  The
-block index is masked out of the quotient, so the block count is rounded to the
-*nearer* power of two - rounding up alone can leave a home array twice as large
-as intended.  The dereference table is then sized from the Poisson expectation
-of the overflow at the average block load that results, plus headroom.  A
-capacity near the target load times a power of two gives the tightest layout.
-
-## Benchmarks
+## Tests and benchmarks
 
 ```sh
-./benchmarks/run_space_eff.sh [entries]                        # space efficiency
-./benchmarks/run_latency.sh [min_log2] [max_log2] [value_bytes] [load_factor]
+./tests/run_tpht_tests.sh          # exhaustive suite across all SIMD levels
+./benchmarks/run_latency.sh        # latency sweep -> results/*.csv (+ PDF if matplotlib)
+./benchmarks/run_space_eff.sh      # space efficiency -> results/*.csv
+./benchmarks/plot_tradeoff.py      # pair the two CSVs into a space-vs-throughput figure
 ```
 
-Both write a CSV into `results/`.
+## More
 
-`run_latency.sh` sweeps table sizes from `2^min_log2` to `2^max_log2` keys
-(default 2^10 to 2^24) for both variants and both key widths, timing four
-phases per size: insert, lookup of a present key, lookup of an absent key, and
-remove.  Tables are sequential and fixed-capacity so no resize work lands in the
-measurement; lookups and removes run in a shuffled order.  Each figure is the
-best of several repetitions, and small tables get more repetitions than large
-ones.  Keys are produced inside the timed loop by a bijective mixer, so the same
-few nanoseconds of key derivation are included in every number and the memory
-traffic being measured is the table's own.
+Design and internals — block layout, quotienting, overflow handling, the
+concurrent resize, hashing, SIMD modes, test architecture — are in
+[docs/INTERNALS.md](docs/INTERNALS.md).
 
-If `matplotlib` is present the script also renders `results/tpht_latency.pdf`
-(vector, TrueType-embedded, so it drops straight into a paper); otherwise it
-leaves the CSV and says so.  `benchmarks/plot_latency.py` can be
-re-run on the CSV by hand.
+## References
 
-## Hashing
-
-The library only ever hashes a single machine word, so it embeds just XXH3's
-4-to-8-byte path rather than the whole algorithm - no secret table, no streaming
-state. Results are bit-identical to `XXH3_64bits_withSeed()` over the key's
-little-endian bytes, verified against upstream xxHash for both widths.
-
-Each key width has its own hash, so a 32-bit table never pays for 64-bit work.
-Either can be replaced without touching anything else:
-
-```sh
-cc -DTPHT_HASH32'(w,s)'=my_hash32 -DTPHT_HASH64'(w,s)'=my_hash64 -c tpht.c
-```
-
-Both macros take a word and a seed and return `uint64_t`.
-
-## SIMD and portability
-
-By default, `tpht.c` enables SIMD-aware fingerprint scanning for `flatten-tpht`:
-
-- x86/x86_64: AVX2 is selected at runtime when the CPU supports it; otherwise SSE2/scalar is used.
-- ARM with NEON: NEON is used when available at compile time.
-- Other CPUs: scalar fallback is used.
-
-You can force scalar-only compilation:
-
-```sh
-cc -std=c11 -O2 -DTPHT_ENABLE_SIMD=0 -I. tpht.c your_file.c -o your_program
-```
-
-For instruction-set testing, `TPHT_SIMD_MODE` supports:
-
-```c
-TPHT_SIMD_AUTO   /* default */
-TPHT_SIMD_SCALAR
-TPHT_SIMD_SSE2
-TPHT_SIMD_AVX2
-TPHT_SIMD_NEON
-```
-
-Only run forced instruction-set binaries on machines that support that instruction set.
-
-## Tests
-
-Run the exhaustive test script:
-
-```sh
-./tests/run_tpht_tests.sh
-```
-
-The script covers:
-
-- scalar fallback build
-- default portable SIMD build
-- forced SSE2 build when supported
-- forced AVX2 build when supported by compiler and runtime
-- forced NEON build when supported
-- pthread concurrent stress build when `-pthread` is available
-- `-march=native` build when supported
-
-The test program covers all supported variant/threading/resize combinations for
-every key size (4, 8) and value size (1 through 8), plus duplicate insertion, updates, removals, fixed-table full behavior, doubling
-resize behavior, invalid configs, storage-layout checks, randomized model
-checking, flattened fill/drain/refill and block-churn checks, and real threaded
-insertion stress.
-
-The tests are split into controlled-granularity modules:
-
-- `tests/tpht_test.c`: single aggregate entrypoint.
-- `tests/tpht_test_common.[ch]`: shared helpers and case enumeration.
-- `tests/tpht_test_config.c`: invalid configuration, storage layout, and flattened block-churn tests.
-- `tests/tpht_test_constructors.c`: generic and variant-specific constructor tests.
-- `tests/tpht_test_api_edges.c`: API edge/error/full-table behavior.
-- `tests/tpht_test_deterministic.c`: deterministic insert/get/update/remove/resize checks.
-- `tests/tpht_test_random_model.c`: randomized model-check tests.
-- `tests/tpht_test_threads.c`: pthread-backed concurrent stress tests when enabled.
-
-## Acknowledgements
-
-- Tiny Pointer Hash Tables / TinyPtr: source design inspiration for the chained and flatten variants.
-- xxHash / XXH3 by Yann Collet: TPHT embeds a small dependency-free subset of XXH3 so users can still copy only `tpht.h` and `tpht.c`. xxHash is BSD 2-Clause licensed: https://github.com/Cyan4973/xxHash
+- Xilin Tang, Yuqi Mai, William Kuszmaul, Alex Conway.
+  *Succinct and Fast Tiny Pointer Hash Tables.* PVLDB 19(9), 2026.
+  [doi:10.14778/3819518.3819542](https://dl.acm.org/doi/10.14778/3819518.3819542),
+  [arXiv:2607.28892](https://arxiv.org/abs/2607.28892).
+- [TinyPtr](https://github.com/Xilinion/TinyPtr): the paper's artifact
+  evaluation code base.
+- xxHash / XXH3 by Yann Collet: TPHT embeds a small dependency-free subset of
+  XXH3 (BSD 2-Clause): https://github.com/Cyan4973/xxHash

@@ -102,14 +102,14 @@ static void duplicate_case(const tpht_test_case_t *tc) {
     /*
      * Flattened tables bound duplicates of one key: every copy lives in the
      * same home block, and a block holds at most ~30 tuples - no amount of
-     * growth splits them, so past the bound insert reports TPHT_FULL (see
+     * growth splits them, so past the bound insert reports TPHT_OVERFLOW (see
      * tpht.h).  Chained tables stack all of them.
      */
     for (i = 0; i < DUPS; ++i) {
         tpht_status_t st = t.insert(t.handle, 77u, i);
         if (st != TPHT_OK) {
             assert(is_flat);
-            assert(st == TPHT_FULL);
+            assert(st == TPHT_OVERFLOW);
             break;
         }
         ++accepted;
