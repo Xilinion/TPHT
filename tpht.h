@@ -37,11 +37,10 @@ extern "C" {
 typedef enum tpht_status {
     TPHT_OK = 0,
     TPHT_NOT_FOUND = 1,
-    TPHT_EXISTS = 2,
-    TPHT_FULL = 3,
-    TPHT_NO_MEMORY = 4,
-    /* Retained for API compatibility; no operation returns it. */
-    TPHT_INVALID = 5
+    /* Structural fullness only - no growth can absorb the write (see the
+     * insert and flatten notes below).  Ordinary fullness grows instead. */
+    TPHT_FULL = 2,
+    TPHT_NO_MEMORY = 3
 } tpht_status_t;
 
 /*
@@ -67,7 +66,6 @@ typedef enum tpht_status {
  *   put     upsert: overwrite the value if the key exists, else append it.
  *   update  overwrite-only: return TPHT_NOT_FOUND if the key is absent.
  *
- * TPHT_EXISTS is retained for API compatibility but insert no longer returns it.
  */
 
 /*

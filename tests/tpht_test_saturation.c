@@ -4,7 +4,7 @@
 
 /*
  * Block-saturation regression tests.  A 64-byte home block can hold at most
- * TPHT_FLAT_MAX_TUPLES - 1 tuples (even all-spilled, x tuples cost x
+ * TPHT_FLAT_MAX_TUPLES tuples (even all-spilled, x tuples cost x
  * fingerprint bytes plus x tiny-pointer bytes, and the count field's ceiling
  * of 31 needs 62 of the 61 usable bytes); the hard-overflow guard used to sit
  * at the ceiling itself, so the 31st tuple's layout ran one byte past the

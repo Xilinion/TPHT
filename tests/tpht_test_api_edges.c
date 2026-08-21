@@ -14,7 +14,7 @@ static void run_api_edges_case(const tpht_test_case_t *tc) {
     assert(t.remove(t.handle, 42u) == TPHT_NOT_FOUND);
     assert(t.insert(t.handle, 42u, 100u) == TPHT_OK);
     /* insert appends unconditionally (no existence probe), so a repeat insert
-     * is an append, not an TPHT_EXISTS.  Overwrite is put/update's job. */
+     * is an append; overwrite is put/update's job. */
     assert(t.insert(t.handle, 42u, 100u) == TPHT_OK);
     assert(t.update(t.handle, 42u, 200u) == TPHT_OK);
     tpht_test_assert_get(&t, tc, 42u, 200u);

@@ -150,6 +150,15 @@ typedef struct tpht_table tpht_table_t;
 #define TPHT_BIN_SIZE 127u
 #define TPHT_DEFAULT_LOAD_FACTOR 0.85
 #define TPHT_MIN_CAPACITY 16u
+
+/*
+ * Internal only - never crosses the public API.  A concurrent attempt that
+ * raced a resize commit and saw a stale storage pointer reports this to its
+ * entry point, which simply re-reads everything and tries again.  It lives
+ * outside the public enum so the public surface stays the four codes that
+ * mean something to a caller.
+ */
+#define TPHT_RETRY ((tpht_status_t)-1)
 #define TPHT_CHAINED_DEREF_LOAD_NUM 95u
 #define TPHT_CHAINED_DEREF_LOAD_DEN 100u
 /*
@@ -221,7 +230,14 @@ typedef struct tpht_table tpht_table_t;
 #define TPHT_FLAT_CONTROL_OFF 61u
 #define TPHT_FLAT_CRYSTALS_OFF 62u
 #define TPHT_FLAT_COUNT_MASK 0x1fu
-#define TPHT_FLAT_MAX_TUPLES 31u
+/*
+ * Most tuples a block may hold: 30.  The 5-bit count field could encode 31,
+ * but 31 tuples never fit - even all-spilled they need 31 fingerprints plus
+ * 31 tiny pointers = 62 bytes, one past the 61 usable.  30 of each is 60.
+ * This is the capacity itself, so the insert guard compares against it
+ * directly; arrays indexed by a count are sized +1 as usual.
+ */
+#define TPHT_FLAT_MAX_TUPLES 30u
 
 
 /* Fingerprints are one quotiented byte, so the home array needs 8 spare bits. */
@@ -2521,7 +2537,7 @@ TPHT_HOT tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, uint64_t key, uint6
          * caller retries with fresh values.  In-bounds-but-wrong blocks from
          * the same race are caught by the pack re-read under the lock.
          */
-        if (TPHT_UNLIKELY(loc.block >> (pack & 63u))) return TPHT_INVALID;
+        if (TPHT_UNLIKELY(loc.block >> (pack & 63u))) return TPHT_RETRY;
         line = (uint8_t *)(uintptr_t)(pack & ~UINT64_C(63)) +
                ((size_t)loc.block << TPHT_FLAT_LINE_SHIFT);
     } else {
@@ -2557,13 +2573,13 @@ TPHT_HOT tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, uint64_t key, uint6
         if (TPHT_UNLIKELY(atomic_load_explicit(&t->flat_lines_pack, memory_order_acquire) !=
                           pack)) {
             tpht_flat_write_end(line, concurrent);
-            return TPHT_INVALID;
+            return TPHT_RETRY;
         }
         if (TPHT_UNLIKELY(tpht_flat_resize_active(t))) {
             tpht_resize_op_t *op = tpht_resize_op_snapshot(t);
             if (TPHT_UNLIKELY(!op || op->old_pack != pack)) {
                 tpht_flat_write_end(line, concurrent);
-                return TPHT_INVALID;
+                return TPHT_RETRY;
             }
             if (op->migrated[loc.block]) shadow_op = op;
         }
@@ -2596,15 +2612,8 @@ TPHT_HOT tpht_status_t tpht_flat_insert_raw(tpht_table_t *t, uint64_t key, uint6
     /* Both counts arrive in one 16-bit load, with the line's own cache miss. */
     meta = tpht_flat_meta(line);
     count = tpht_flat_meta_count(meta);
-    /*
-     * Hard overflow: the block cannot hold another tuple.  The bound is one
-     * below the count field's ceiling, because a count of TPHT_FLAT_MAX_TUPLES
-     * is representable but never fits: even all-spilled, x tuples cost x
-     * fingerprint bytes plus x tiny-pointer bytes, and 2 * 31 already exceeds
-     * the 61 usable bytes.  Guarding at the ceiling itself let a 31st tuple
-     * in, whose layout ran one byte past the line into the metadata field.
-     */
-    if (TPHT_UNLIKELY(count >= TPHT_FLAT_MAX_TUPLES - 1u)) {
+    /* Hard overflow: the block is at capacity (see TPHT_FLAT_MAX_TUPLES). */
+    if (TPHT_UNLIKELY(count >= TPHT_FLAT_MAX_TUPLES)) {
         atomic_store_explicit(&t->flat_deref_pressure, 0u, memory_order_relaxed);
         tpht_flat_write_end(line, concurrent);
         return TPHT_FULL;
@@ -3010,7 +3019,7 @@ TPHT_HOT tpht_status_t tpht_flat_write(tpht_table_t *t, uint64_t key, uint64_t v
                 }
             }
             st = tpht_flat_insert_raw(t, key, value, replace, key_bytes, concurrent);
-            if (TPHT_UNLIKELY(st == TPHT_INVALID)) continue; /* raced a commit */
+            if (TPHT_UNLIKELY(st == TPHT_RETRY)) continue; /* raced a commit */
             if (TPHT_UNLIKELY(st == TPHT_FULL)) {
                 if (tpht_flat_resize_active(t)) {
                     /* The block cannot take another tuple until the running
@@ -3092,11 +3101,11 @@ TPHT_HOT tpht_status_t tpht_flat_write(tpht_table_t *t, uint64_t key, uint64_t v
 static tpht_status_t tpht_flat_update_op(tpht_table_t *t, uint64_t key, uint64_t value,
                                          unsigned key_bytes, int concurrent) {
     /* One critical section: find and overwrite, or report absent.  On a
-     * concurrent table TPHT_INVALID means the attempt raced a resize commit
+     * concurrent table TPHT_RETRY means the attempt raced a resize commit
      * and saw a stale storage pointer; retrying re-reads everything. */
     for (;;) {
         tpht_status_t st = tpht_flat_insert_raw(t, key, value, 2, key_bytes, concurrent);
-        if (!concurrent || !TPHT_UNLIKELY(st == TPHT_INVALID)) return st;
+        if (!concurrent || !TPHT_UNLIKELY(st == TPHT_RETRY)) return st;
     }
 }
 

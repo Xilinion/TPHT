@@ -5,7 +5,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 CC=${CC:-cc}
 BUILD_DIR=${BUILD_DIR:-"$ROOT/build-tests"}
 COMMON_FLAGS="-std=c11 -Wall -Wextra -Werror -O2 -I$ROOT"
-TEST_SRCS="$ROOT/tests/tpht_test.c $ROOT/tests/tpht_test_common.c $ROOT/tests/tpht_test_config.c $ROOT/tests/tpht_test_constructors.c $ROOT/tests/tpht_test_api_edges.c $ROOT/tests/tpht_test_deterministic.c $ROOT/tests/tpht_test_random_model.c $ROOT/tests/tpht_test_saturation.c $ROOT/tests/tpht_test_threads.c"
+TEST_SRCS="$ROOT/tests/tpht_test.c $ROOT/tests/tpht_test_common.c $ROOT/tests/tpht_test_config.c $ROOT/tests/tpht_test_constructors.c $ROOT/tests/tpht_test_api_edges.c $ROOT/tests/tpht_test_deterministic.c $ROOT/tests/tpht_test_random_model.c $ROOT/tests/tpht_test_saturation.c $ROOT/tests/tpht_test_churn.c $ROOT/tests/tpht_test_threads.c"
 
 mkdir -p "$BUILD_DIR"
 
